@@ -1,0 +1,130 @@
+name: Verify backend PostgreSQL integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-postgres-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: patroai_ci
+          POSTGRES_PASSWORD: patroai_ci_password
+          POSTGRES_DB: patroai_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U patroai_ci -d patroai_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      CI: "true"
+      PLATFORM_ENVIRONMENT: "test"
+      PLATFORM_AUTH_MODE: "test"
+      PLATFORM_INVITATION_TOKEN_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      DATABASE_URL: "postgresql+psycopg://patroai_ci:patroai_ci_password@127.0.0.1:5432/patroai_ci"
+      AUTH_MIGRATION_REHEARSAL_ALLOW_DESTRUCTIVE: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify immutable workflow action pinning
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python scripts/check_workflow_action_pinning.py
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+
+      - name: PostgreSQL connectivity preflight
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import sqlalchemy as sa
+
+          engine = sa.create_engine(
+              "postgresql+psycopg://patroai_ci:patroai_ci_password@127.0.0.1:5432/patroai_ci",
+              pool_pre_ping=True,
+          )
+          with engine.connect() as conn:
+              version = conn.exec_driver_sql("select current_setting('server_version')").scalar_one()
+          print(f"POSTGRESQL_PREFLIGHT=PASS version={version}")
+          PY
+
+      - name: Verify migration hygiene
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python scripts/check_migration_hygiene.py
+
+      - name: PostgreSQL migration rehearsal
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build-evidence
+          python scripts/auth_migration_rehearsal.py             | tee build-evidence/postgres-migration-rehearsal.log
+
+      - name: PostgreSQL-focused tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pytest             tests/test_database_url_normalization.py             tests/test_migration_chain_rc1_auth_d.py             tests/test_foundation_hardening_contract.py             --junitxml=build-evidence/postgres-pytest-junit.xml
+
+      - name: Record evidence metadata
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build-evidence
+          {
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "python=$(python --version 2>&1 || true)"
+            echo "postgres_integration=true"
+          } > build-evidence/postgres-ci-metadata.txt
+
+      - name: Upload PostgreSQL CI evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4 series immutable SHA
+        with:
+          name: orkio-backend-postgres-ci-evidence
+          path: build-evidence/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

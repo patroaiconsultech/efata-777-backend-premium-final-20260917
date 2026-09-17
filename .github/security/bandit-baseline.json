@@ -1,0 +1,69 @@
+{
+  "findings": [
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/audit_archive_adapter.py",
+      "severity": "LOW",
+      "test_id": "B101"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/email_delivery.py",
+      "severity": "MEDIUM",
+      "test_id": "B310"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/large_document.py",
+      "severity": "LOW",
+      "test_id": "B110"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/large_document.py",
+      "severity": "MEDIUM",
+      "test_id": "B314"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/large_document.py",
+      "severity": "LOW",
+      "test_id": "B405"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/python_tool.py",
+      "severity": "LOW",
+      "test_id": "B404"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/python_tool.py",
+      "severity": "LOW",
+      "test_id": "B603"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 2,
+      "path": "src/orkio_v2/services/realtime_execution.py",
+      "severity": "LOW",
+      "test_id": "B110"
+    },
+    {
+      "confidence": "HIGH",
+      "count": 1,
+      "path": "src/orkio_v2/services/realtime_execution.py",
+      "severity": "LOW",
+      "test_id": "B112"
+    }
+  ],
+  "policy": "known-findings-baseline; fail on new or increased findings",
+  "version": 1
+}

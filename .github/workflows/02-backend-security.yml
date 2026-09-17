@@ -1,0 +1,343 @@
+name: Verify backend security gate
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import sys
+          assert sys.version_info[:2] == (3, 12), sys.version
+          print("SECURITY_PYTHON_VERSION_GATE=PASS")
+          PY
+
+      - name: Install pinned security tooling
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "bandit==1.9.4" \
+            "pip-audit==2.10.1" \
+            "detect-secrets==1.5.0"
+          mkdir -p build-security
+
+      - name: SAST — Bandit
+        id: bandit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          bandit_rc=0
+          bandit -r src \
+            --format json \
+            --output build-security/bandit.json || bandit_rc=$?
+
+          # Bandit exit 1 means findings were detected and is evaluated below.
+          # Any other non-zero result means the scanner itself failed.
+          if [ "$bandit_rc" -gt 1 ]; then
+            echo "BANDIT_SCANNER=ERROR exit_code=${bandit_rc}"
+            exit "$bandit_rc"
+          fi
+
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          baseline = json.loads(
+              Path(".github/security/bandit-baseline.json").read_text(encoding="utf-8")
+          )
+          result = json.loads(
+              Path("build-security/bandit.json").read_text(encoding="utf-8")
+          )
+
+          expected = Counter()
+          for item in baseline.get("findings", []):
+              expected[(
+                  item["path"],
+                  item["test_id"],
+                  item["severity"],
+                  item["confidence"],
+              )] += int(item["count"])
+
+          actual = Counter()
+          for item in result.get("results", []):
+              actual[(
+                  item.get("filename"),
+                  item.get("test_id"),
+                  item.get("issue_severity"),
+                  item.get("issue_confidence"),
+              )] += 1
+
+          regressions = []
+          improvements = []
+
+          for key in sorted(set(expected) | set(actual)):
+              before = expected[key]
+              now = actual[key]
+              if now > before:
+                  regressions.append((key, before, now))
+              elif now < before:
+                  improvements.append((key, before, now))
+
+          print(f"BANDIT_BASELINE_TOTAL={sum(expected.values())}")
+          print(f"BANDIT_CURRENT_TOTAL={sum(actual.values())}")
+
+          for key, before, now in improvements:
+              print(
+                  "BANDIT_IMPROVEMENT "
+                  f"path={key[0]} test_id={key[1]} "
+                  f"baseline={before} current={now}"
+              )
+
+          for key, before, now in regressions:
+              print(
+                  "BANDIT_REGRESSION "
+                  f"path={key[0]} test_id={key[1]} "
+                  f"severity={key[2]} confidence={key[3]} "
+                  f"baseline={before} current={now}"
+              )
+
+          if regressions:
+              print(f"BANDIT_GATE=FAIL regressions={len(regressions)}")
+              raise SystemExit(1)
+
+          print("BANDIT_GATE=PASS regressions=0")
+          PY
+
+      - name: Working-tree secret scan — detect-secrets
+        id: secrets
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          detect-secrets scan \
+            --all-files \
+            --exclude-files '(^|/)\.git/|^build-security/' \
+            > /tmp/detect-secrets.json
+
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          raw_path = Path("/tmp/detect-secrets.json")
+          baseline_path = Path(".github/security/secret-scan-baseline.json")
+
+          data = json.loads(raw_path.read_text(encoding="utf-8"))
+          baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+          results = data.get("results") or {}
+
+          findings = []
+          actual = Counter()
+
+          for path, items in results.items():
+              for item in items or []:
+                  kind = item.get("type")
+                  findings.append({
+                      "path": path,
+                      "line_number": item.get("line_number"),
+                      "type": kind,
+                  })
+                  actual[(path, kind)] += 1
+
+          expected = Counter()
+          for item in baseline.get("findings", []):
+              expected[(item["path"], item["type"])] += int(item["count"])
+
+          summary = {
+              "finding_count": len(findings),
+              "findings": findings,
+              "raw_secret_values_persisted": False,
+          }
+
+          Path("build-security/secret-scan-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+
+          # Never persist the raw scanner output.
+          raw_path.unlink(missing_ok=True)
+
+          regressions = []
+          improvements = []
+
+          for key in sorted(set(expected) | set(actual)):
+              before = expected[key]
+              now = actual[key]
+              if now > before:
+                  regressions.append((key, before, now))
+              elif now < before:
+                  improvements.append((key, before, now))
+
+          print(f"SECRET_BASELINE_TOTAL={sum(expected.values())}")
+          print(f"SECRET_CURRENT_TOTAL={sum(actual.values())}")
+
+          for key, before, now in improvements:
+              print(
+                  "SECRET_SCAN_IMPROVEMENT "
+                  f"path={key[0]} type={key[1]!r} "
+                  f"baseline={before} current={now}"
+              )
+
+          for key, before, now in regressions:
+              print(
+                  "SECRET_SCAN_REGRESSION "
+                  f"path={key[0]} type={key[1]!r} "
+                  f"baseline={before} current={now}"
+              )
+
+          if regressions:
+              print(f"SECRET_SCAN_GATE=FAIL regressions={len(regressions)}")
+              raise SystemExit(1)
+
+          print("SECRET_SCAN_GATE=PASS regressions=0")
+          PY
+
+      - name: Runtime dependency audit + CycloneDX SBOM — pip-audit
+        id: dependencies
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Resolve the backend runtime dependency graph from the canonical project
+          # metadata plus the `stt` extra in an isolated environment. The local ORKIO
+          # project itself is private/non-PyPI and is excluded from vulnerability lookup;
+          # all resolved third-party distributions remain pinned and auditable.
+          #
+          # Note: exact equivalence with the production Dockerfile dependency lock is
+          # tracked separately; this gate audits the project dependency contract used by CI.
+          python -m venv /tmp/orkio-runtime-audit-venv
+          /tmp/orkio-runtime-audit-venv/bin/python -m pip install --upgrade pip
+          /tmp/orkio-runtime-audit-venv/bin/python -m pip install -e '.[stt]'
+
+          /tmp/orkio-runtime-audit-venv/bin/python -m pip freeze \
+            --exclude-editable \
+            > /tmp/orkio-runtime-third-party.txt
+
+          if grep -qiE 'orkio-platform-backend-rc1|^-e |file://' /tmp/orkio-runtime-third-party.txt; then
+            echo "ERROR: local ORKIO root leaked into third-party audit input"
+            exit 1
+          fi
+
+          pip-audit \
+            --requirement /tmp/orkio-runtime-third-party.txt \
+            --no-deps \
+            --strict \
+            --format cyclonedx-json \
+            --output build-security/runtime-dependency-audit.cdx.json \
+            --progress-spinner off
+
+      - name: Record security evidence metadata
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build-security
+          {
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "python=$(python --version 2>&1 || true)"
+            echo "bandit=$(bandit --version 2>&1 | head -n 1 || true)"
+            echo "pip_audit=$(pip-audit --version 2>&1 || true)"
+            echo "detect_secrets=$(detect-secrets --version 2>&1 || true)"
+            echo "bandit_outcome=${{ steps.bandit.outcome }}"
+            echo "bandit_policy=known-findings-baseline"
+            echo "bandit_baseline=.github/security/bandit-baseline.json"
+            echo "secret_scan_outcome=${{ steps.secrets.outcome }}"
+            echo "secret_scan_policy=known-findings-baseline"
+            echo "secret_scan_baseline=.github/security/secret-scan-baseline.json"
+            echo "dependency_audit_outcome=${{ steps.dependencies.outcome }}"
+            echo "runtime_dependency_target=orkio-platform-backend-rc1[stt]"
+            echo "runtime_dependency_resolution=isolated-venv-freeze-third-party"
+            echo "runtime_dependency_root_policy=exclude-editable-local-project"
+            echo "runtime_dependency_audit_mode=pinned-no-deps-strict"
+            echo "sbom_file=runtime-dependency-audit.cdx.json"
+            echo "github_token_permissions=contents:read"
+            echo "checkout_persist_credentials=false"
+          } > build-security/security-metadata.txt
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4 series immutable SHA
+        with:
+          name: orkio-backend-security-evidence
+          path: build-security/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Enforce security gate
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          failed=0
+
+          if [ "${{ steps.bandit.outcome }}" != "success" ]; then
+            echo "BANDIT_GATE=FAIL"
+            failed=1
+          else
+            echo "BANDIT_GATE=PASS"
+          fi
+
+          if [ "${{ steps.secrets.outcome }}" != "success" ]; then
+            echo "SECRET_SCAN_GATE=FAIL"
+            failed=1
+          else
+            echo "SECRET_SCAN_GATE=PASS"
+          fi
+
+          if [ "${{ steps.dependencies.outcome }}" != "success" ]; then
+            echo "DEPENDENCY_AUDIT_GATE=FAIL"
+            failed=1
+          else
+            echo "DEPENDENCY_AUDIT_GATE=PASS"
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "BACKEND_SECURITY_GATE=FAIL"
+            exit 1
+          fi
+
+          echo "BACKEND_SECURITY_GATE=PASS"

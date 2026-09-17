@@ -1,0 +1,81 @@
+{
+  "forbidden_public_privileges": [
+    "CREATE",
+    "TEMPORARY"
+  ],
+  "forbidden_role_attributes": [],
+  "forbidden_security_facts": [],
+  "principal_rules": [
+    {
+      "aliases_allowed": false,
+      "forbidden_true_attributes": [
+        "rolsuper",
+        "rolbypassrls",
+        "rolcreaterole",
+        "rolcreatedb",
+        "rolreplication"
+      ],
+      "max_count": 1,
+      "min_count": 1,
+      "physical_role_names": [
+        "efata_schema_collector_fixture"
+      ],
+      "principal_class": "SCHEMA_COLLECTOR"
+    },
+    {
+      "aliases_allowed": false,
+      "forbidden_true_attributes": [
+        "rolsuper",
+        "rolbypassrls",
+        "rolcreaterole",
+        "rolcreatedb",
+        "rolreplication"
+      ],
+      "max_count": 1,
+      "min_count": 1,
+      "physical_role_names": [
+        "efata_runtime_fixture"
+      ],
+      "principal_class": "APPLICATION_RUNTIME"
+    },
+    {
+      "aliases_allowed": false,
+      "max_count": 1,
+      "min_count": 1,
+      "physical_role_names": [
+        "efata_role_a"
+      ],
+      "principal_class": "FIXTURE_ROLE_A"
+    },
+    {
+      "aliases_allowed": false,
+      "max_count": 1,
+      "min_count": 1,
+      "physical_role_names": [
+        "efata_privileged_role"
+      ],
+      "principal_class": "FIXTURE_PRIVILEGED_ROLE",
+      "required_true_attributes": [
+        "rolbypassrls"
+      ]
+    },
+    {
+      "aliases_allowed": false,
+      "max_count": 1,
+      "min_count": 1,
+      "physical_role_names": [
+        "efata_fixture_bootstrap"
+      ],
+      "principal_class": "ADMIN_OPERATOR",
+      "required_true_attributes": [
+        "rolsuper"
+      ]
+    }
+  ],
+  "profile_id": "EFATA-FIXTURE-SECURITY-PROFILE",
+  "profile_version": "1",
+  "required_security_facts": [
+    "role:efata_schema_collector_fixture",
+    "role:efata_runtime_fixture"
+  ]
+}

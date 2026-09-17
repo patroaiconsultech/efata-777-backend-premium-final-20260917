@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orkio-platform-backend-rc1"
+version = "0.7.0"
+description = "ORKIO Plataforma 2.0 controlled RC1 test implementation"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110,<1",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.5,<3",
+  "uvicorn>=0.30,<1",
+  "sqlalchemy>=2.0,<3",
+  "alembic>=1.13,<2",
+  "psycopg[binary]>=3.1,<4",
+  "openai==2.46.0",
+  "httpx>=0.27,<1",
+  "PyJWT[crypto]>=2.8,<3",
+  "cryptography>=50.0.0,<51",
+  "python-multipart>=0.0.9,<1",
+  "defusedxml>=0.7,<1",
+  "email-validator>=2.2,<3",
+  "boto3>=1.35,<2",
+  "openpyxl>=3.1,<4",
+  "pypdf>=5.0,<7",
+  "python-pptx>=1.0,<2",
+  "reportlab>=4.0,<6"
+]
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<1", "httpx>=0.27,<1"]
+stt = ["faster-whisper==1.2.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"orkio_v2.agents" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

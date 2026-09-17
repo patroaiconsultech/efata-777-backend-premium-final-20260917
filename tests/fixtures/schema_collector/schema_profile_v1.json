@@ -1,0 +1,46 @@
+{
+  "accepted_alembic_revisions": [
+    "009_audit_evidence_ledger"
+  ],
+  "allowed_extra_objects": [],
+  "allowed_extra_patterns": [
+    "type:public.alembic_version",
+    "type:public.business_items",
+    "type:public.business_items_view",
+    "index:public.business_items.*",
+    "column:public.business_items_view.*"
+  ],
+  "allowed_recommended_indexes": [],
+  "forbidden_objects": [],
+  "profile_id": "EFATA-FIXTURE-SCHEMA-PROFILE",
+  "profile_version": "1",
+  "required_namespaces": [
+    "public"
+  ],
+  "required_objects": [
+    "namespace:public",
+    "table:public.alembic_version",
+    "table:public.business_items",
+    "sequence:public.business_items_id_seq",
+    "view:public.business_items_view",
+    "column:public.alembic_version.version_num",
+    "column:public.business_items.id",
+    "column:public.business_items.tenant_id",
+    "column:public.business_items.name",
+    "column:public.business_items.status",
+    "column:public.business_items.updated_at",
+    "constraint:public.alembic_version.alembic_version_pkey",
+    "constraint:public.business_items.business_items_pk",
+    "constraint:public.business_items.business_items_name_tenant_uq",
+    "constraint:public.business_items.business_items_name_nonempty",
+    "index:public.alembic_version.alembic_version_pkey",
+    "index:public.business_items.business_items_pk",
+    "index:public.business_items.business_items_name_tenant_uq",
+    "type:public.business_item_status",
+    "type:public.tenant_key",
+    "function:public.touch_updated_at()",
+    "function:public.secure_item_count(tenant text)",
+    "trigger:public.business_items.business_items_touch",
+    "rls_policy:public.business_items.tenant_isolation"
+  ]
+}
