@@ -745,35 +745,38 @@ def admin_otp_start(
     password: str,
     settings: Settings,
 ) -> NativeAdminOtpIssue:
+    """Issue an email OTP for an existing allowlisted admin.
+
+    The password argument remains in the transport contract for backward
+    compatibility with the already-deployed frontend, but access no longer
+    depends on a legacy NativeCredential. For the internal EFATÀ corridor,
+    possession of the allowlisted mailbox plus an active admin membership in
+    the canonical tenant is the authentication path.
+    """
+    del password
     tenant_id = ADMIN_TENANT_ID
     normalized_email = normalize_email(email)
     if not _admin_email_allowed(normalized_email, settings):
         raise NativeAuthError("INVALID_CREDENTIALS")
     user = db.scalar(select(User).where(User.email == normalized_email))
-    credential = db.scalar(
-        select(NativeCredential).where(NativeCredential.user_id == user.id)
-    ) if user is not None else None
-    timestamp = now()
-    if user is None or credential is None:
-        audit(db, action="native_auth.admin_otp_start", outcome="failure", metadata={"reason": "invalid_credentials"})
-        raise NativeAuthError("INVALID_CREDENTIALS")
-    locked_until = _aware(credential.locked_until)
-    if locked_until and locked_until > timestamp:
-        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "locked"})
-        raise NativeAuthError("ACCOUNT_TEMPORARILY_LOCKED")
-    if not verify_password(password, credential.password_hash, settings):
-        credential.failed_login_count += 1
-        if credential.failed_login_count >= settings.native_login_max_failures:
-            credential.locked_until = timestamp + timedelta(minutes=settings.native_login_lock_minutes)
-        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "bad_password"})
+    if user is None:
+        audit(
+            db,
+            action="native_auth.admin_otp_start",
+            outcome="failure",
+            metadata={"reason": "admin_identity_missing"},
+        )
         raise NativeAuthError("INVALID_CREDENTIALS")
     membership = _admin_membership(db, user_id=user.id, tenant_id=tenant_id)
     if membership is None:
-        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "admin_membership_missing"})
+        audit(
+            db,
+            action="native_auth.admin_otp_start",
+            outcome="failure",
+            actor_id=user.id,
+            metadata={"reason": "admin_membership_missing"},
+        )
         raise NativeAuthError("ADMIN_ROLE_REQUIRED")
-    credential.failed_login_count = 0
-    credential.locked_until = None
-    credential.last_login_at = timestamp
     code = f"{secrets.randbelow(1_000_000):06d}"
     token, _ = _challenge(
         db,
