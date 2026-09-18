@@ -1,0 +1,6 @@
+ESTEVEZ_GUARDA_RELEASE=MVP2_AUTH_2026-09-18_R1
+PURPOSE=Force an unambiguous new Git source commit after Railway GitHub source reconnection.
+EXPECTED_RUNTIME_ROUTE=/api/account/login
+EXPECTED_ALEMBIC_HEAD=003_portal_accounts
+EXPECTED_AGENT_ACTIVE_KNOWLEDGE=ESTEVEZ_MVP_PUBLICO,TRF4,AGENTE
+NOTE=This file is a deployment provenance marker only. It is not application configuration.
