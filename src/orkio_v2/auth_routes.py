@@ -22,6 +22,9 @@ from .schemas import (
     NativeReauthenticateRequest,
     NativeSessionRecordOut,
     NativeBootstrapOwnerRequest,
+    NativeAdminOtpStartRequest,
+    NativeAdminOtpStartOut,
+    NativeAdminOtpVerifyRequest,
     NativeLoginRequest,
     NativeRegisterWithGrantRequest,
     NativeResetPasswordRequest,
@@ -30,6 +33,8 @@ from .schemas import (
 from .services.native_auth import (
     NativeAuthError,
     NativeLoginChallenge,
+    admin_otp_start,
+    admin_otp_verify,
     bootstrap_owner,
     create_or_update_credential,
     create_account_recovery_challenge,
@@ -251,6 +256,75 @@ def native_login(
         )
     _set_session_cookie(response, result.token, settings)
     return _session_out(result.principal)
+
+@router.post("/admin/otp/start", response_model=NativeAdminOtpStartOut)
+def admin_otp_start_route(
+    payload: NativeAdminOtpStartRequest,
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    if settings.auth_mode not in {"native_session", "native_or_oidc"}:
+        raise HTTPException(404, "NATIVE_AUTH_DISABLED")
+    try:
+        issue = admin_otp_start(
+            db,
+            email=str(payload.email),
+            password=payload.password,
+            settings=settings,
+        )
+        send_resend_email(
+            settings=settings,
+            to_email=issue.email,
+            subject="PatroAI | Código de acesso administrativo",
+            text_body=(
+                "Seu código de acesso administrativo PatroAI é: "
+                f"{issue.code}\n\n"
+                "O código expira em 10 minutos e pode ser usado uma única vez."
+            ),
+            idempotency_key=f"native-admin-otp:{issue.token[:18]}",
+        )
+    except NativeAuthError as exc:
+        db.rollback()
+        status = 403 if exc.code == "ADMIN_ROLE_REQUIRED" else 401
+        raise HTTPException(status, exc.code) from exc
+    except EmailDeliveryError as exc:
+        db.rollback()
+        raise HTTPException(503, "ADMIN_OTP_DELIVERY_UNAVAILABLE") from exc
+    db.commit()
+    return NativeAdminOtpStartOut(
+        status="OTP_SENT",
+        challenge_token=issue.token,
+        expires_in_seconds=600,
+    )
+
+
+@router.post("/admin/otp/verify", response_model=NativeSessionOut)
+def admin_otp_verify_route(
+    payload: NativeAdminOtpVerifyRequest,
+    response: Response,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    if settings.auth_mode not in {"native_session", "native_or_oidc"}:
+        raise HTTPException(404, "NATIVE_AUTH_DISABLED")
+    try:
+        result = admin_otp_verify(
+            db,
+            token=payload.challenge_token,
+            code=payload.code,
+            settings=settings,
+            user_agent=request.headers.get("user-agent", ""),
+            client_ip=_client_ip(request),
+        )
+    except NativeAuthError as exc:
+        db.commit()
+        status = 403 if exc.code == "ADMIN_ROLE_REQUIRED" else 401
+        raise HTTPException(status, exc.code) from exc
+    db.commit()
+    _set_session_cookie(response, result.token, settings)
+    return _session_out(result.principal)
+
 
 @router.post("/register", response_model=NativeSessionOut)
 def native_register(

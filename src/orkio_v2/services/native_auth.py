@@ -38,6 +38,7 @@ SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
 KEY_LENGTH = 32
+ADMIN_TENANT_ID = "patroai"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,13 @@ class NativePasswordResetIssue:
     reset_id: str
     user_id: str
     email: str
+
+
+@dataclass(frozen=True)
+class NativeAdminOtpIssue:
+    token: str
+    email: str
+    code: str
 
 
 class NativeAuthError(Exception):
@@ -332,7 +340,8 @@ def _load_challenge(
     )
     if item is None or item.used_at is not None or _aware(item.expires_at) <= now():
         raise NativeAuthError("AUTH_CHALLENGE_INVALID")
-    if item.attempts >= 8:
+    max_attempts = 5 if purpose == "admin_email_otp" else 8
+    if item.attempts >= max_attempts:
         raise NativeAuthError("AUTH_CHALLENGE_INVALID")
     item.attempts += 1
     return item
@@ -701,6 +710,123 @@ def login(
         user_agent=user_agent,
         client_ip=client_ip,
         mfa_verified=False,
+    )
+
+
+def _admin_email_allowed(email: str, settings: Settings) -> bool:
+    allowlist = {
+        item.strip().lower()
+        for item in settings.admin_email_allowlist.split(",")
+        if item.strip()
+    }
+    return email in allowlist
+
+
+def _admin_membership(
+    db: Session,
+    *,
+    user_id: str,
+    tenant_id: str,
+) -> Membership | None:
+    return db.scalar(
+        select(Membership).where(
+            Membership.user_id == user_id,
+            Membership.tenant_id == tenant_id,
+            Membership.active.is_(True),
+            Membership.role.in_(("admin", "owner", "orkio_admin", "platform_owner")),
+        )
+    )
+
+
+def admin_otp_start(
+    db: Session,
+    *,
+    email: str,
+    password: str,
+    settings: Settings,
+) -> NativeAdminOtpIssue:
+    tenant_id = ADMIN_TENANT_ID
+    normalized_email = normalize_email(email)
+    if not _admin_email_allowed(normalized_email, settings):
+        raise NativeAuthError("INVALID_CREDENTIALS")
+    user = db.scalar(select(User).where(User.email == normalized_email))
+    credential = db.scalar(
+        select(NativeCredential).where(NativeCredential.user_id == user.id)
+    ) if user is not None else None
+    timestamp = now()
+    if user is None or credential is None:
+        audit(db, action="native_auth.admin_otp_start", outcome="failure", metadata={"reason": "invalid_credentials"})
+        raise NativeAuthError("INVALID_CREDENTIALS")
+    locked_until = _aware(credential.locked_until)
+    if locked_until and locked_until > timestamp:
+        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "locked"})
+        raise NativeAuthError("ACCOUNT_TEMPORARILY_LOCKED")
+    if not verify_password(password, credential.password_hash, settings):
+        credential.failed_login_count += 1
+        if credential.failed_login_count >= settings.native_login_max_failures:
+            credential.locked_until = timestamp + timedelta(minutes=settings.native_login_lock_minutes)
+        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "bad_password"})
+        raise NativeAuthError("INVALID_CREDENTIALS")
+    membership = _admin_membership(db, user_id=user.id, tenant_id=tenant_id)
+    if membership is None:
+        audit(db, action="native_auth.admin_otp_start", outcome="failure", actor_id=user.id, metadata={"reason": "admin_membership_missing"})
+        raise NativeAuthError("ADMIN_ROLE_REQUIRED")
+    credential.failed_login_count = 0
+    credential.locked_until = None
+    credential.last_login_at = timestamp
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    token, _ = _challenge(
+        db,
+        purpose="admin_email_otp",
+        user_id=user.id,
+        tenant_id=tenant_id,
+        settings=settings,
+        payload={"code_hash": session_digest(code, settings)},
+        ttl_minutes=10,
+    )
+    audit(
+        db,
+        action="native_auth.admin_otp_issued",
+        outcome="pending_delivery",
+        tenant_id=tenant_id,
+        actor_id=user.id,
+        metadata={"channel": "email", "ttl_seconds": 600},
+    )
+    return NativeAdminOtpIssue(token=token, email=normalized_email, code=code)
+
+
+def admin_otp_verify(
+    db: Session,
+    *,
+    token: str,
+    code: str,
+    settings: Settings,
+    user_agent: str = "",
+    client_ip: str | None = None,
+) -> NativeLoginResult:
+    challenge = _load_challenge(db, token=token, purpose="admin_email_otp", settings=settings)
+    code_hash = str(challenge.payload.get("code_hash") or "")
+    if not code_hash or not hmac.compare_digest(session_digest(code.strip(), settings), code_hash):
+        raise NativeAuthError("ADMIN_OTP_INVALID")
+    principal = _principal_for_user(db, user_id=challenge.user_id, tenant_id=challenge.tenant_id)
+    if not set(principal.roles).intersection({"admin", "owner", "orkio_admin", "platform_owner"}):
+        raise NativeAuthError("ADMIN_ROLE_REQUIRED")
+    challenge.used_at = now()
+    audit(
+        db,
+        action="native_auth.admin_otp_verified",
+        outcome="success",
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        metadata={"channel": "email"},
+    )
+    return issue_session(
+        db,
+        principal=principal,
+        settings=settings,
+        user_agent=user_agent,
+        client_ip=client_ip,
+        mfa_verified=True,
     )
 
 

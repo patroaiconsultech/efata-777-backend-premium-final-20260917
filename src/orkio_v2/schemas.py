@@ -176,6 +176,24 @@ class NativeLoginRequest(BaseModel):
     return_path: str | None = Field(default=None, max_length=512)
 
 
+class NativeAdminOtpStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=256)
+
+
+class NativeAdminOtpStartOut(BaseModel):
+    status: str
+    challenge_token: str
+    expires_in_seconds: int
+
+
+class NativeAdminOtpVerifyRequest(BaseModel):
+    challenge_token: str = Field(min_length=32, max_length=512)
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
 class NativeRegisterWithGrantRequest(BaseModel):
     grant: str = Field(min_length=32, max_length=4096)
     email: EmailStr
