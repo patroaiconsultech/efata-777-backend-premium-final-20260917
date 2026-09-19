@@ -33,7 +33,11 @@ from .services.artifact_context import artifact_context_message
 from .services.platform_knowledge import system_capability_guard_message
 from .services.knowledge_retrieval import knowledge_context_messages
 from .services.attachment_service import AttachmentIdentityConflict, persist_attachment
-from .services.unified_document_intake import UnifiedDocumentIntakeError, ingest_large_paste
+from .services.unified_document_intake import (
+    UnifiedDocumentIntakeError,
+    ingest_large_file,
+    ingest_large_paste,
+)
 from .services.blob_storage import BlobStorageError, build_blob_storage
 from .agents.registry import AgentNotFound, list_agents
 from .services.execution_router import resolve_direct_target_decision
@@ -1680,23 +1684,77 @@ def participants(thread_id:str,p:Principal=Depends(require_provisioned_principal
     rows=db.scalars(select(ThreadParticipant).where(ThreadParticipant.thread_id==thread_id,ThreadParticipant.active.is_(True))).all()
     return [{"id":x.id,"user_id":x.user_id,"role":x.thread_role,"membership_type":x.membership_type} for x in rows]
 
+_THREAD_DOCUMENT_ALLOWED_MIME = {
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+    "application/json",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+_THREAD_DOCUMENT_SUFFIX_MIME = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".json": "application/json",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def _resolve_thread_document_upload_identity(file: UploadFile) -> tuple[str, str]:
+    safe = PurePosixPath((file.filename or "file").replace("\\", "/")).name
+    if not safe or safe in {".", ".."} or "\x00" in safe:
+        raise HTTPException(400, "FILENAME_INVALID")
+    mime_type = (
+        file.content_type
+        if file.content_type in _THREAD_DOCUMENT_ALLOWED_MIME
+        else _THREAD_DOCUMENT_SUFFIX_MIME.get(Path(safe).suffix.lower(), file.content_type)
+    )
+    if mime_type not in _THREAD_DOCUMENT_ALLOWED_MIME:
+        raise HTTPException(415, "MIME_TYPE_NOT_ALLOWED")
+    return safe, str(mime_type)
+
+
 @router.get("/document-intake/capabilities")
 def document_intake_capabilities(
     p: Principal = Depends(require_provisioned_principal),
     settings: Settings = Depends(get_settings),
 ):
     del p
+    thread_context_enabled = bool(
+        settings.artifacts_enabled
+        and settings.unified_document_intake_enabled
+        and settings.document_context_enabled
+    )
     return {
         "large_paste": {
             "supported": True,
-            "enabled": bool(settings.unified_document_intake_enabled),
+            "enabled": thread_context_enabled,
             "threshold_chars": int(settings.document_intake_large_paste_threshold_chars),
             "max_chars": int(settings.document_intake_large_paste_max_chars),
             "max_bytes": int(settings.document_intake_large_paste_max_bytes),
             "canonical_format": "text/markdown",
             "context_mode": "selective",
             "requires_explicit_confirmation": True,
-        }
+        },
+        "large_file": {
+            "supported": True,
+            "enabled": bool(
+                thread_context_enabled
+                and settings.large_document_pipeline_enabled
+            ),
+            "threshold_bytes": int(settings.max_upload_bytes),
+            "max_bytes": int(settings.knowledge_large_document_max_upload_bytes),
+            "canonical_format": "text/markdown",
+            "context_mode": "selective",
+            "requires_explicit_confirmation": False,
+        },
     }
 
 
@@ -1743,6 +1801,53 @@ def intake_large_paste(
     }
 
 
+@router.post("/threads/{thread_id}/document-intake/file")
+async def intake_large_file_upload(
+    thread_id: str,
+    file: UploadFile = File(...),
+    p: Principal = Depends(require_provisioned_principal),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    if not settings.artifacts_enabled:
+        raise HTTPException(403, "ARTIFACTS_DISABLED")
+    _, member = thread_access(db, thread_id, p)
+    if member.thread_role == ThreadRole.viewer.value:
+        raise HTTPException(403, "THREAD_READ_ONLY")
+    if not member.can_upload_files:
+        raise HTTPException(403, "UPLOAD_PERMISSION_REQUIRED")
+    safe, mime_type = _resolve_thread_document_upload_identity(file)
+    try:
+        result = await ingest_large_file(
+            db,
+            settings=settings,
+            principal=p,
+            thread_id=thread_id,
+            file=file,
+            filename=safe,
+            mime_type=mime_type,
+        )
+    except UnifiedDocumentIntakeError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
+    return {
+        "intake_status": "ready",
+        "document_reference": result.attachment.id,
+        "attachment_id": result.attachment.id,
+        "filename": result.source_filename,
+        "canonical_filename": result.attachment.filename,
+        "source_kind": "LARGE_FILE",
+        "source_sha256": result.source_sha256,
+        "source_size_bytes": result.source_size_bytes,
+        "source_chars": result.source_chars,
+        "canonical_sha256": result.canonical_sha256,
+        "canonical_chars": result.canonical_chars,
+        "sections": result.sections,
+        "chunks": result.chunks,
+        "context_mode": "selective",
+        "reused": result.reused,
+    }
+
+
 @router.post("/threads/{thread_id}/attachments")
 async def upload_attachment(thread_id:str,file:UploadFile=File(...),p:Principal=Depends(require_provisioned_principal),
                             settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
@@ -1752,26 +1857,8 @@ async def upload_attachment(thread_id:str,file:UploadFile=File(...),p:Principal=
     if not member.can_upload_files: raise HTTPException(403,"UPLOAD_PERMISSION_REQUIRED")
     data=await file.read(settings.max_upload_bytes+1)
     if len(data)>settings.max_upload_bytes: raise HTTPException(413,"FILE_TOO_LARGE")
-    allowed={"application/pdf","text/plain","text/csv","text/markdown","application/json",
-             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-             "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
     digest=hashlib.sha256(data).hexdigest()
-    safe=PurePosixPath((file.filename or "file").replace("\\","/")).name
-    if not safe or safe in {".",".."}: raise HTTPException(400,"FILENAME_INVALID")
-    suffix_mimes={
-        ".pdf":"application/pdf",
-        ".txt":"text/plain",
-        ".csv":"text/csv",
-        ".md":"text/markdown",
-        ".markdown":"text/markdown",
-        ".json":"application/json",
-        ".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".xlsx":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".pptx":"application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    }
-    mime_type=file.content_type if file.content_type in allowed else suffix_mimes.get(Path(safe).suffix.lower(), file.content_type)
-    if mime_type not in allowed: raise HTTPException(415,"MIME_TYPE_NOT_ALLOWED")
+    safe,mime_type=_resolve_thread_document_upload_identity(file)
     key=f"{p.tenant_id}/{thread_id}/{digest}-{safe}"
     root=Path(settings.artifact_storage_path).resolve()
     target=(root/key).resolve()

@@ -407,3 +407,183 @@ def test_r3_team_runtime_passes_latest_user_query_to_document_context(
         )
 
     assert captured["query_text"] == "Pergunta financeira de governança para o Team"
+
+
+
+def _configure_large_file_intake(monkeypatch, tmp_path, *, normal_max=128, large_max=200_000):
+    settings = _configure_intake(monkeypatch, tmp_path, threshold=20)
+    monkeypatch.setattr(settings, "large_document_pipeline_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "max_upload_bytes", normal_max, raising=False)
+    monkeypatch.setattr(
+        settings, "knowledge_large_document_max_upload_bytes", large_max, raising=False
+    )
+    monkeypatch.setattr(settings, "knowledge_chunk_target_chars", 240, raising=False)
+    monkeypatch.setattr(settings, "knowledge_chunk_overlap_chars", 24, raising=False)
+    return settings
+
+
+def _large_file_markdown() -> bytes:
+    return (
+        "# Documento Grande\n\n"
+        "## Financeiro\n"
+        + ("financeiro governança compliance contrato operação segura " * 80)
+        + "\n\n## Operações\n"
+        + ("processo estabilidade execução auditável tenant " * 80)
+    ).encode("utf-8")
+
+
+def test_r3_large_file_capability_is_backend_authoritative(client, monkeypatch, tmp_path):
+    settings = _configure_large_file_intake(
+        monkeypatch, tmp_path, normal_max=321, large_max=654321
+    )
+    response = client.get("/api/v2/document-intake/capabilities", headers=headers())
+    assert response.status_code == 200
+    cap = response.json()["large_file"]
+    assert cap == {
+        "supported": True,
+        "enabled": True,
+        "threshold_bytes": 321,
+        "max_bytes": 654321,
+        "canonical_format": "text/markdown",
+        "context_mode": "selective",
+        "requires_explicit_confirmation": False,
+    }
+    assert settings.large_document_pipeline_enabled is True
+
+
+def test_r3_large_file_streams_to_thread_bound_canonical_context(
+    client, monkeypatch, tmp_path
+):
+    settings = _configure_large_file_intake(monkeypatch, tmp_path)
+    thread_id = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
+    raw = _large_file_markdown()
+
+    response = client.post(
+        f"/api/v2/threads/{thread_id}/document-intake/file",
+        files={"file": ("manual-grande.md", raw, "text/markdown")},
+        headers=headers(),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_kind"] == "LARGE_FILE"
+    assert body["source_size_bytes"] == len(raw)
+    assert body["context_mode"] == "selective"
+    assert body["reused"] is False
+    assert body["canonical_filename"].endswith(".md")
+
+    with Testing() as db:
+        attachment = db.get(Attachment, body["attachment_id"])
+        assert attachment is not None
+        assert attachment.tenant_id == "tenant-1"
+        assert attachment.thread_id == thread_id
+        assert attachment.mime_type == "text/markdown"
+        assert attachment.sha256 == body["canonical_sha256"]
+
+        audit = db.scalar(
+            select(AuditEvent).where(
+                AuditEvent.resource_type == "attachment",
+                AuditEvent.resource_id == attachment.id,
+                AuditEvent.action == "document_intake.file.ready",
+            )
+        )
+        assert audit is not None
+        assert audit.metadata_json["source_kind"] == "LARGE_FILE"
+
+        bundle = build_document_context(
+            db,
+            settings=settings,
+            tenant_id="tenant-1",
+            thread_id=thread_id,
+            query_text="financeiro governança compliance",
+        )
+        assert bundle is not None
+        assert "financeiro" in bundle.message["content"]
+        assert "governança" in bundle.message["content"]
+
+    storage = LocalBlobStorage(tmp_path)
+    manifest = json.loads(
+        storage.get(manifest_key_for_storage(attachment.storage_key)).decode("utf-8")
+    )
+    assert manifest["source_kind"] == "LARGE_FILE"
+    assert manifest["source_filename"] == "manual-grande.md"
+    assert manifest["source_size_bytes"] == len(raw)
+    assert storage.get(manifest["source_storage_key"]) == raw
+    ingest_root = Path(settings.artifact_storage_path) / ".ingest"
+    assert not list(ingest_root.glob("*.uploading"))
+    assert not list(ingest_root.glob("*.canonical.md"))
+
+
+def test_r3_large_file_reuses_same_thread_document_idempotently(
+    client, monkeypatch, tmp_path
+):
+    _configure_large_file_intake(monkeypatch, tmp_path)
+    thread_id = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
+    raw = _large_file_markdown()
+
+    first = client.post(
+        f"/api/v2/threads/{thread_id}/document-intake/file",
+        files={"file": ("same.md", raw, "text/markdown")},
+        headers=headers(),
+    )
+    second = client.post(
+        f"/api/v2/threads/{thread_id}/document-intake/file",
+        files={"file": ("same.md", raw, "text/markdown")},
+        headers=headers(),
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["attachment_id"] == second.json()["attachment_id"]
+    assert second.json()["reused"] is True
+
+
+def test_r3_large_file_route_rejects_small_file_instead_of_silently_reclassifying(
+    client, monkeypatch, tmp_path
+):
+    _configure_large_file_intake(monkeypatch, tmp_path, normal_max=1024)
+    thread_id = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
+
+    response = client.post(
+        f"/api/v2/threads/{thread_id}/document-intake/file",
+        files={"file": ("small.md", b"# small\ncontent", "text/markdown")},
+        headers=headers(),
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "FILE_BELOW_LARGE_INTAKE_THRESHOLD"
+
+
+def test_r3_viewer_cannot_create_large_file_document(client, monkeypatch, tmp_path):
+    _configure_large_file_intake(monkeypatch, tmp_path)
+    thread_id = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
+
+    with Testing() as db:
+        participant = db.scalar(
+            select(ThreadParticipant).where(
+                ThreadParticipant.thread_id == thread_id,
+                ThreadParticipant.user_id == "user-1",
+            )
+        )
+        assert participant is not None
+        participant.thread_role = "viewer"
+        participant.can_upload_files = True
+        db.commit()
+
+    response = client.post(
+        f"/api/v2/threads/{thread_id}/document-intake/file",
+        files={"file": ("viewer.md", _large_file_markdown(), "text/markdown")},
+        headers=headers(),
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "THREAD_READ_ONLY"
+
+
+
+def test_r3_document_intake_capabilities_fail_closed_without_thread_context(
+    client, monkeypatch, tmp_path
+):
+    settings = _configure_large_file_intake(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "document_context_enabled", False, raising=False)
+    response = client.get("/api/v2/document-intake/capabilities", headers=headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["large_paste"]["enabled"] is False
+    assert body["large_file"]["enabled"] is False

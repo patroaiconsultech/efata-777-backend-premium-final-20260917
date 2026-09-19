@@ -7,17 +7,25 @@ import logging
 from pathlib import Path
 import tempfile
 
+from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from ..auth import Principal
 from ..models import AuditEvent, Attachment
-from .attachment_service import AttachmentIdentityConflict, persist_attachment
+from .attachment_service import (
+    AttachmentIdentityConflict,
+    persist_attachment,
+    persist_attachment_file,
+)
 from .blob_storage import BlobStorageError, build_blob_storage
 from .large_document import (
     LargeDocumentError,
     build_structure,
     canonicalize_source,
+    cleanup_staged_upload,
     hash_file,
+    sanitize_filename,
+    stage_upload,
 )
 
 
@@ -47,6 +55,21 @@ class PasteIntakeResult:
     manifest_key: str
 
 
+@dataclass(frozen=True, slots=True)
+class FileIntakeResult:
+    attachment: Attachment
+    reused: bool
+    source_filename: str
+    source_sha256: str
+    source_size_bytes: int
+    source_chars: int
+    canonical_sha256: str
+    canonical_chars: int
+    sections: int
+    chunks: int
+    manifest_key: str
+
+
 def manifest_key_for_storage(storage_key: str) -> str:
     return f"{storage_key}{INTAKE_MANIFEST_SUFFIX}"
 
@@ -60,6 +83,7 @@ def _manifest_bytes(
     *,
     tenant_id: str,
     thread_id: str,
+    source_kind: str,
     source_sha256: str,
     source_chars: int,
     canonical_sha256: str,
@@ -68,10 +92,13 @@ def _manifest_bytes(
     title: str,
     sections,
     chunks,
+    source_filename: str | None = None,
+    source_size_bytes: int | None = None,
+    source_storage_key: str | None = None,
 ) -> bytes:
     payload = {
         "schema": INTAKE_MANIFEST_SCHEMA,
-        "source_kind": "LARGE_PASTE",
+        "source_kind": source_kind,
         "tenant_id": tenant_id,
         "thread_id": thread_id,
         "title": title,
@@ -109,6 +136,13 @@ def _manifest_bytes(
             for row in chunks
         ],
     }
+    if source_filename is not None:
+        payload["source_filename"] = source_filename
+    if source_size_bytes is not None:
+        payload["source_size_bytes"] = source_size_bytes
+    if source_storage_key is not None:
+        payload["source_storage_key"] = source_storage_key
+
     return (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
@@ -120,6 +154,7 @@ def _validate_existing_manifest(
     *,
     tenant_id: str,
     thread_id: str,
+    source_kind: str,
     source_sha256: str,
     canonical_sha256: str,
 ) -> None:
@@ -132,6 +167,7 @@ def _validate_existing_manifest(
         or payload.get("schema") != INTAKE_MANIFEST_SCHEMA
         or payload.get("tenant_id") != tenant_id
         or payload.get("thread_id") != thread_id
+        or payload.get("source_kind") != source_kind
         or payload.get("source_sha256") != source_sha256
         or payload.get("canonical_sha256") != canonical_sha256
     ):
@@ -206,6 +242,7 @@ def ingest_large_paste(
     manifest_bytes = _manifest_bytes(
         tenant_id=principal.tenant_id,
         thread_id=thread_id,
+        source_kind="LARGE_PASTE",
         source_sha256=source_sha256,
         source_chars=source_chars,
         canonical_sha256=canonical_sha256,
@@ -233,6 +270,7 @@ def ingest_large_paste(
                 storage.get(manifest_key),
                 tenant_id=principal.tenant_id,
                 thread_id=thread_id,
+                source_kind="LARGE_PASTE",
                 source_sha256=source_sha256,
                 canonical_sha256=canonical_sha256,
             )
@@ -308,6 +346,228 @@ def ingest_large_paste(
         reused=persisted.reused,
         source_sha256=source_sha256,
         source_chars=source_chars,
+        canonical_sha256=canonical_sha256,
+        canonical_chars=canonical.canonical_chars,
+        sections=len(sections),
+        chunks=len(chunks),
+        manifest_key=manifest_key,
+    )
+
+
+async def ingest_large_file(
+    db: Session,
+    *,
+    settings,
+    principal: Principal,
+    thread_id: str,
+    file: UploadFile,
+    filename: str,
+    mime_type: str,
+) -> FileIntakeResult:
+    """Stream, canonicalize, index, and bind a large file to one conversation.
+
+    The original source is retained in governed blob storage while the Attachment
+    row points at canonical UTF-8 Markdown plus an intake manifest. Document context
+    therefore performs selective range reads without loading the complete source or
+    canonical representation into application memory.
+    """
+    if not getattr(settings, "unified_document_intake_enabled", False):
+        raise UnifiedDocumentIntakeError("DOCUMENT_INTAKE_DISABLED", 403)
+    if not getattr(settings, "large_document_pipeline_enabled", False):
+        raise UnifiedDocumentIntakeError("LARGE_DOCUMENT_PIPELINE_DISABLED", 403)
+
+    safe = sanitize_filename(filename)
+    staged = None
+    canonical_path: Path | None = None
+    storage = build_blob_storage(settings)
+    source_created = False
+    manifest_created = False
+
+    try:
+        staged = await stage_upload(
+            file,
+            settings=settings,
+            max_bytes=int(settings.knowledge_large_document_max_upload_bytes),
+        )
+        if staged.size_bytes <= 0:
+            raise UnifiedDocumentIntakeError("FILE_EMPTY", 422)
+        if staged.size_bytes <= int(settings.max_upload_bytes):
+            raise UnifiedDocumentIntakeError("FILE_BELOW_LARGE_INTAKE_THRESHOLD", 422)
+
+        canonical = canonicalize_source(
+            staged.path,
+            mime_type=mime_type,
+            filename=safe,
+            settings=settings,
+        )
+        canonical_path = canonical.path
+        sections, chunks = build_structure(
+            canonical.path,
+            chunk_target_chars=int(settings.knowledge_chunk_target_chars),
+            chunk_overlap_chars=int(settings.knowledge_chunk_overlap_chars),
+        )
+        canonical_sha256 = hash_file(canonical.path)
+        canonical_size_bytes = canonical.path.stat().st_size
+
+        source_key = (
+            f"{principal.tenant_id}/{thread_id}/document-intake/source/"
+            f"{staged.sha256}-{safe}"
+        )
+        canonical_filename = f"{Path(safe).stem[:180]}-{staged.sha256[:12]}.md"
+        canonical_key = (
+            f"{principal.tenant_id}/{thread_id}/document-intake/canonical/"
+            f"{canonical_sha256}-{canonical_filename}"
+        )
+        manifest_key = manifest_key_for_storage(canonical_key)
+
+        source_created = storage.put_file_if_absent(
+            source_key,
+            staged.path,
+            content_type=mime_type,
+        )
+
+        manifest_bytes = _manifest_bytes(
+            tenant_id=principal.tenant_id,
+            thread_id=thread_id,
+            source_kind="LARGE_FILE",
+            source_sha256=staged.sha256,
+            source_chars=canonical.source_chars,
+            canonical_sha256=canonical_sha256,
+            canonical_chars=canonical.canonical_chars,
+            canonical_size_bytes=canonical_size_bytes,
+            title=safe,
+            sections=sections,
+            chunks=chunks,
+            source_filename=safe,
+            source_size_bytes=staged.size_bytes,
+            source_storage_key=source_key,
+        )
+        if len(manifest_bytes) > int(
+            getattr(settings, "document_intake_manifest_max_bytes", 2_000_000)
+        ):
+            raise UnifiedDocumentIntakeError("DOCUMENT_INTAKE_MANIFEST_TOO_LARGE", 413)
+
+        manifest_created = storage.put_if_absent(
+            manifest_key,
+            manifest_bytes,
+            content_type="application/json",
+        )
+        if not manifest_created:
+            _validate_existing_manifest(
+                storage.get(manifest_key),
+                tenant_id=principal.tenant_id,
+                thread_id=thread_id,
+                source_kind="LARGE_FILE",
+                source_sha256=staged.sha256,
+                canonical_sha256=canonical_sha256,
+            )
+
+        persisted = persist_attachment_file(
+            db,
+            tenant_id=principal.tenant_id,
+            thread_id=thread_id,
+            uploaded_by=principal.user_id,
+            filename=canonical_filename,
+            mime_type="text/markdown",
+            source_path=canonical.path,
+            size_bytes=canonical_size_bytes,
+            sha256=canonical_sha256,
+            storage_key=canonical_key,
+            storage=storage,
+        )
+    except UnifiedDocumentIntakeError:
+        if manifest_created:
+            try:
+                storage.delete(manifest_key)
+            except Exception:
+                pass
+        if source_created:
+            try:
+                storage.delete(source_key)
+            except Exception:
+                pass
+        raise
+    except LargeDocumentError as exc:
+        if source_created:
+            try:
+                storage.delete(source_key)
+            except Exception:
+                pass
+        raise UnifiedDocumentIntakeError(exc.code, exc.status_code) from exc
+    except (BlobStorageError, AttachmentIdentityConflict) as exc:
+        if manifest_created:
+            try:
+                storage.delete(manifest_key)
+            except BlobStorageError:
+                pass
+        if source_created:
+            try:
+                storage.delete(source_key)
+            except BlobStorageError:
+                pass
+        if isinstance(exc, AttachmentIdentityConflict):
+            raise UnifiedDocumentIntakeError("DOCUMENT_INTAKE_IDENTITY_CONFLICT", 409) from exc
+        raise UnifiedDocumentIntakeError(str(exc), 503) from exc
+    except Exception:
+        if manifest_created:
+            try:
+                storage.delete(manifest_key)
+            except BlobStorageError:
+                pass
+        if source_created:
+            try:
+                storage.delete(source_key)
+            except BlobStorageError:
+                pass
+        raise
+    finally:
+        if canonical_path is not None:
+            canonical_path.unlink(missing_ok=True)
+        elif staged is not None:
+            staged.path.with_name(f"{staged.path.name}.canonical.md").unlink(missing_ok=True)
+        cleanup_staged_upload(staged)
+
+    try:
+        db.add(
+            AuditEvent(
+                tenant_id=principal.tenant_id,
+                actor_id=principal.user_id,
+                action="document_intake.file.ready",
+                resource_type="attachment",
+                resource_id=persisted.attachment.id,
+                outcome="SUCCESS",
+                metadata_json={
+                    "thread_id": thread_id,
+                    "source_kind": "LARGE_FILE",
+                    "source_filename": safe,
+                    "source_sha256": staged.sha256,
+                    "source_size_bytes": staged.size_bytes,
+                    "canonical_sha256": canonical_sha256,
+                    "source_chars": canonical.source_chars,
+                    "canonical_chars": canonical.canonical_chars,
+                    "sections": len(sections),
+                    "chunks": len(chunks),
+                    "reused": persisted.reused,
+                },
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "DOCUMENT_INTAKE_AUDIT_WRITE_FAILED tenant_id=%s thread_id=%s attachment_id=%s",
+            principal.tenant_id,
+            thread_id,
+            persisted.attachment.id,
+        )
+
+    return FileIntakeResult(
+        attachment=persisted.attachment,
+        reused=persisted.reused,
+        source_filename=safe,
+        source_sha256=staged.sha256,
+        source_size_bytes=staged.size_bytes,
+        source_chars=canonical.source_chars,
         canonical_sha256=canonical_sha256,
         canonical_chars=canonical.canonical_chars,
         sections=len(sections),

@@ -193,3 +193,102 @@ def persist_attachment(
         raise
 
     return AttachmentPersistResult(row, created=True, reused=False)
+
+
+def persist_attachment_file(
+    db: Session,
+    *,
+    tenant_id: str,
+    thread_id: str,
+    uploaded_by: str,
+    filename: str,
+    mime_type: str,
+    source_path: Path,
+    size_bytes: int,
+    sha256: str,
+    storage_key: str,
+    storage: BlobStorage,
+) -> AttachmentPersistResult:
+    """Persist one logical attachment from a staged file using bounded memory.
+
+    This mirrors persist_attachment() semantics while delegating blob transfer to
+    BlobStorage.put_file_if_absent(), so large canonical documents never need to
+    be materialized as a single bytes object in application memory.
+    """
+    if size_bytes < 0:
+        raise ValueError("ATTACHMENT_SIZE_INVALID")
+
+    existing = _find_existing(
+        db,
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        storage_key=storage_key,
+    )
+    if existing is not None:
+        if not _same_logical_attachment(
+            existing,
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise AttachmentIdentityConflict("ATTACHMENT_IDENTITY_CONFLICT")
+        storage.put_file_if_absent(storage_key, source_path, content_type=mime_type)
+        return AttachmentPersistResult(existing, created=False, reused=True)
+
+    blob_created = storage.put_file_if_absent(
+        storage_key,
+        source_path,
+        content_type=mime_type,
+    )
+    row = Attachment(
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        uploaded_by=uploaded_by,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        sha256=sha256,
+        storage_key=storage_key,
+    )
+    db.add(row)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+
+        if is_storage_key_unique_conflict(exc):
+            canonical = _find_existing(
+                db,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                storage_key=storage_key,
+            )
+            if canonical is not None and _same_logical_attachment(
+                canonical,
+                filename=filename,
+                mime_type=mime_type,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            ):
+                return AttachmentPersistResult(
+                    canonical,
+                    created=False,
+                    reused=True,
+                )
+
+        canonical = _find_existing(
+            db,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            storage_key=storage_key,
+        )
+        if canonical is None and blob_created:
+            try:
+                storage.delete(storage_key)
+            except BlobStorageError:
+                pass
+        raise
+
+    return AttachmentPersistResult(row, created=True, reused=False)
