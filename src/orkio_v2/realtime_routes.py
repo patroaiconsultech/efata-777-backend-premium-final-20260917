@@ -245,9 +245,9 @@ def _raise_team_contract(exc: TeamContractError) -> None:
 def realtime_capabilities(
     p: Principal = Depends(require_provisioned_principal),
     settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ):
-    del p
-    return realtime_capability(settings)
+    return realtime_capability(settings, db=db, tenant_id=p.tenant_id)
 
 
 @router.post("/threads/{thread_id}/realtime/calls")
@@ -329,7 +329,7 @@ async def realtime_call(
         metadata=intent_metadata,
     )
 
-    capability = realtime_capability(settings)
+    capability = realtime_capability(settings, db=db, tenant_id=p.tenant_id)
     session_capability = capability["realtime_session"]
     if not bool(session_capability.get("eligible")):
         code = str(session_capability.get("reason_code") or "REALTIME_NOT_CONFIGURED")

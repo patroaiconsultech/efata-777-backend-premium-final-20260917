@@ -557,7 +557,7 @@ def test_realtime_bridge_failure_is_observable(
 
     monkeypatch.setattr(
         "orkio_v2.realtime_routes.realtime_capability",
-        lambda settings: _call_capability(
+        lambda settings, **kwargs: _call_capability(
             session_eligible=True,
             bridge_eligible=False,
             voice_output_eligible=False,
@@ -626,7 +626,7 @@ def test_realtime_voice_output_failure_is_observable_without_new_failed_audit(
 
     monkeypatch.setattr(
         "orkio_v2.realtime_routes.realtime_capability",
-        lambda settings: _call_capability(
+        lambda settings, **kwargs: _call_capability(
             session_eligible=True,
             bridge_eligible=True,
             voice_output_eligible=False,
@@ -685,7 +685,7 @@ def test_realtime_voice_binding_failure_is_observable_without_new_failed_audit(
 
     monkeypatch.setattr(
         "orkio_v2.realtime_routes.realtime_capability",
-        lambda settings: _call_capability(),
+        lambda settings, **kwargs: _call_capability(),
     )
 
     def fail_binding(*args, **kwargs):
@@ -745,7 +745,7 @@ def test_realtime_provider_failure_is_observable_and_preserves_contract(
 
     monkeypatch.setattr(
         "orkio_v2.realtime_routes.realtime_capability",
-        lambda settings: _call_capability(),
+        lambda settings, **kwargs: _call_capability(),
     )
 
     monkeypatch.setattr(

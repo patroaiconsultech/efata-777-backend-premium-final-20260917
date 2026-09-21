@@ -4,6 +4,60 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from typing import Literal
 
+class AdminVoiceCatalogCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_key: Literal["openai"] = "openai"
+    provider_voice_id: str = Field(min_length=1, max_length=120)
+    display_name: str = Field(min_length=2, max_length=120)
+    provider_model: str = Field("gpt-4o-mini-tts", min_length=1, max_length=120)
+    source_type: Literal["BUILT_IN", "CUSTOM_PROVIDER"] = "BUILT_IN"
+    license_label: str = Field("PROVIDER_TERMS", min_length=1, max_length=160)
+    cost_class: str = Field("API_USAGE_BILLED", min_length=1, max_length=40)
+    provenance_url: str | None = Field(default=None, max_length=500)
+    catalog_version: str = Field("1", min_length=1, max_length=64)
+    supported_locales: list[Literal["pt-BR", "en-US", "es-419"]] = Field(
+        default_factory=lambda: ["pt-BR"]
+    )
+    delivery_modes: list[
+        Literal["REALTIME_STREAM", "MESSAGE_PLAYBACK", "VOICE_MESSAGE"]
+    ] = Field(
+        default_factory=lambda: ["REALTIME_STREAM", "MESSAGE_PLAYBACK"]
+    )
+
+    @model_validator(mode="after")
+    def non_empty_capabilities(self):
+        if not self.supported_locales:
+            raise ValueError("VOICE_CATALOG_LOCALES_REQUIRED")
+        if not self.delivery_modes:
+            raise ValueError("VOICE_CATALOG_DELIVERY_MODES_REQUIRED")
+        return self
+
+
+class AdminVoiceCatalogCurationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    curation_status: Literal["APPROVED", "REJECTED"]
+    evidence_ref: str = Field(min_length=8, max_length=500)
+
+
+class AdminVoiceCatalogDeactivateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_ref: str = Field(min_length=8, max_length=500)
+
+
+class AdminVoiceCatalogPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(
+        "Esta é uma prévia da voz selecionada para a Plataforma Efatà 777.",
+        min_length=1,
+        max_length=600,
+    )
+    locale: Literal["pt-BR", "en-US", "es-419"] = "pt-BR"
+
+
 class AdminVoiceAssignmentUpsert(BaseModel):
     voice_catalog_id: str = Field(min_length=1, max_length=64)
     locale: str = Field("pt-BR", min_length=2, max_length=24)
@@ -19,6 +73,11 @@ class AdminVoiceAssignmentValidationUpdate(BaseModel):
 
 
 class AdminVoiceAssignmentActivationRequest(BaseModel):
+    evidence_ref: str = Field(min_length=8, max_length=500)
+
+
+
+class AdminVoiceAssignmentDeactivationRequest(BaseModel):
     evidence_ref: str = Field(min_length=8, max_length=500)
 
 class ThreadCreate(BaseModel):

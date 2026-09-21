@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_platform_invitation_migration_is_new_head_and_reversible_contract():
     config = Config(str(ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["012_platform_user_invitations"]
+    assert script.get_heads() == ["013_agent_studio_control_plane"]
     revision = script.get_revision("012_platform_user_invitations")
     assert revision is not None
     assert revision.down_revision == "011_billing_wallet"

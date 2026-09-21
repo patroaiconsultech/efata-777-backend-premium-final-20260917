@@ -30,7 +30,7 @@ with engine.begin() as connection:
     connection.exec_driver_sql("DELETE FROM alembic_version")
     connection.exec_driver_sql(
         "INSERT INTO alembic_version(version_num) "
-        "VALUES ('012_platform_user_invitations')"
+        "VALUES ('013_agent_studio_control_plane')"
     )
 
 def override_db():

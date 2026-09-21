@@ -926,6 +926,92 @@ class AgentVoiceAssignment(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
+class AgentStudioVersion(Base):
+    """Tenant-scoped, versioned control-plane configuration for agents.
+
+    Runtime activation intentionally remains fail-closed until the canonical
+    agent registry becomes tenant-aware.
+    """
+
+    __tablename__ = "agent_studio_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_slug",
+            "version",
+            name="uq_agent_studio_tenant_slug_version",
+        ),
+        CheckConstraint(
+            "source_kind IN ('CUSTOM','CANONICAL_OVERRIDE')",
+            name="ck_agent_studio_source_kind",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('DRAFT','REVIEW','APPROVED','ACTIVE','SUSPENDED','RETIRED')",
+            name="ck_agent_studio_lifecycle_state",
+        ),
+        CheckConstraint(
+            "temperature >= 0 AND temperature <= 2",
+            name="ck_agent_studio_temperature",
+        ),
+        CheckConstraint(
+            "daily_budget_usd IS NULL OR daily_budget_usd >= 0",
+            name="ck_agent_studio_daily_budget_nonnegative",
+        ),
+        CheckConstraint(
+            "monthly_budget_usd IS NULL OR monthly_budget_usd >= 0",
+            name="ck_agent_studio_monthly_budget_nonnegative",
+        ),
+        Index(
+            "ix_agent_studio_tenant_slug_state",
+            "tenant_id",
+            "agent_slug",
+            "lifecycle_state",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        index=True,
+    )
+    agent_slug: Mapped[str] = mapped_column(String(80), index=True)
+    base_agent_slug: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), default="CUSTOM", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+    display_name: Mapped[str] = mapped_column(String(160))
+    canonical_name: Mapped[str] = mapped_column(String(160))
+    role_label: Mapped[str] = mapped_column(String(200), default="")
+    department: Mapped[str] = mapped_column(String(160), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    system_instruction: Mapped[str] = mapped_column(Text, default="")
+
+    provider: Mapped[str] = mapped_column(String(80), default="openai")
+    model_name: Mapped[str] = mapped_column(String(160), default="")
+    temperature: Mapped[Decimal] = mapped_column(Numeric(4, 2), default=Decimal("0.20"))
+
+    capabilities_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    knowledge_config_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    daily_budget_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    monthly_budget_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+
+    lifecycle_state: Mapped[str] = mapped_column(String(24), default="DRAFT", index=True)
+    runtime_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    review_evidence_ref: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    approval_evidence_ref: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    updated_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    approved_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class UserExperienceProfile(Base):
     __tablename__ = "user_experience_profiles"
     __table_args__ = (

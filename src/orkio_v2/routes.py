@@ -1,8 +1,10 @@
 import asyncio, hashlib, json, logging, threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select, text, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from .auth import Principal, require_principal
 from .config import Settings, get_settings
@@ -39,6 +41,9 @@ from .services.unified_document_intake import (
     ingest_large_paste,
 )
 from .services.blob_storage import BlobStorageError, build_blob_storage
+from .billing import repository as billing_repository
+from .services.voice_binding import VoiceProfile
+from .services.text_to_speech import TextToSpeechError, synthesize_speech
 from .agents.registry import AgentNotFound, list_agents
 from .services.execution_router import resolve_direct_target_decision
 from .services.target_resolver import TargetAmbiguous, TargetNotFound
@@ -329,6 +334,89 @@ def _require_console_superadmin(p: Principal, settings: Settings) -> Principal:
     return require_allowlisted_admin_principal(p, settings)
 
 
+@router.get("/admin/usage-costs")
+def admin_usage_costs(
+    days: int = Query(30, ge=1, le=90),
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    events = db.scalars(
+        select(AuditEvent)
+        .where(
+            AuditEvent.tenant_id == p.tenant_id,
+            AuditEvent.action == "message_tts_request",
+            AuditEvent.created_at >= cutoff,
+        )
+        .order_by(AuditEvent.created_at.desc())
+    ).all()
+
+    requests = 0
+    provider_syntheses = 0
+    cache_hits = 0
+    idempotency_replays = 0
+    chars_requested = 0
+    chars_provider = 0
+    by_agent: dict[str, dict[str, int]] = {}
+
+    for event in events:
+        if event.outcome != "success":
+            continue
+        metadata = event.metadata_json or {}
+        requests += 1
+        chars = int(metadata.get("chars") or 0)
+        chars_requested += chars
+        cache_hit = bool(metadata.get("cache_hit"))
+        replay = bool(metadata.get("idempotency_replay"))
+        if cache_hit:
+            cache_hits += 1
+        if replay:
+            idempotency_replays += 1
+        if not cache_hit and not replay:
+            provider_syntheses += 1
+            chars_provider += chars
+        agent_id = str(metadata.get("agent_id") or "unknown")
+        bucket = by_agent.setdefault(
+            agent_id,
+            {"requests": 0, "provider_syntheses": 0, "chars": 0},
+        )
+        bucket["requests"] += 1
+        bucket["chars"] += chars
+        if not cache_hit and not replay:
+            bucket["provider_syntheses"] += 1
+
+    rate = float(settings.tts_cost_per_1m_chars_usd)
+    estimated = round((chars_provider / 1_000_000.0) * rate, 6) if rate > 0 else None
+    billing = billing_repository.admin_summary(db, tenant_id=p.tenant_id)
+
+    return {
+        "tenant_id": p.tenant_id,
+        "window_days": days,
+        "tts": {
+            "requests": requests,
+            "provider_syntheses": provider_syntheses,
+            "cache_hits": cache_hits,
+            "idempotency_replays": idempotency_replays,
+            "chars_requested": chars_requested,
+            "chars_provider_synthesized": chars_provider,
+            "cost_rate_configured": rate > 0,
+            "cost_per_1m_chars_usd": rate if rate > 0 else None,
+            "estimated_provider_cost_usd": estimated,
+            "by_agent": by_agent,
+        },
+        "billing": {
+            key: float(value) if hasattr(value, "as_tuple") else value
+            for key, value in billing.items()
+        },
+        "llm_usage": {
+            "status": "NOT_METERED",
+            "reason_code": "LLM_TOKEN_LEDGER_NOT_IMPLEMENTED",
+        },
+    }
+
+
 @router.get("/admin/users")
 def admin_users(
     p: Principal = Depends(require_provisioned_superadmin),
@@ -379,15 +467,8 @@ def admin_agents(
     ]
 
 
-@router.get("/admin/voice-catalog")
-def admin_voice_catalog(
-    p: Principal = Depends(require_provisioned_superadmin),
-    settings: Settings = Depends(get_settings),
-    db: Session = Depends(get_db),
-):
-    _require_console_superadmin(p, settings)
-    rows = db.scalars(select(VoiceCatalogEntry).order_by(VoiceCatalogEntry.provider_key, VoiceCatalogEntry.display_name)).all()
-    return [{
+def _admin_voice_catalog_payload(row: VoiceCatalogEntry) -> dict:
+    return {
         "id": row.id,
         "provider_key": row.provider_key,
         "provider_voice_id": row.provider_voice_id,
@@ -402,7 +483,218 @@ def admin_voice_catalog(
         "delivery_modes": row.delivery_modes,
         "curation_status": row.curation_status,
         "active": row.active,
-    } for row in rows]
+    }
+
+
+@router.get("/admin/voice-catalog")
+def admin_voice_catalog(
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    rows = db.scalars(
+        select(VoiceCatalogEntry).order_by(
+            VoiceCatalogEntry.provider_key,
+            VoiceCatalogEntry.display_name,
+        )
+    ).all()
+    return [_admin_voice_catalog_payload(row) for row in rows]
+
+
+@router.post("/admin/voice-catalog")
+def admin_create_voice_catalog_entry(
+    body: AdminVoiceCatalogCreate,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    duplicate = db.scalar(
+        select(VoiceCatalogEntry).where(
+            VoiceCatalogEntry.provider_key == body.provider_key,
+            VoiceCatalogEntry.provider_voice_id == body.provider_voice_id,
+        )
+    )
+    if duplicate is not None:
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_EXISTS")
+
+    row = VoiceCatalogEntry(
+        provider_key=body.provider_key,
+        provider_voice_id=body.provider_voice_id.strip(),
+        display_name=body.display_name.strip(),
+        provider_model=body.provider_model.strip(),
+        source_type=body.source_type,
+        license_label=body.license_label.strip(),
+        cost_class=body.cost_class.strip(),
+        provenance_url=(body.provenance_url or "").strip() or None,
+        catalog_version=body.catalog_version.strip(),
+        supported_locales=list(dict.fromkeys(body.supported_locales)),
+        delivery_modes=list(dict.fromkeys(body.delivery_modes)),
+        curation_status="REVIEW_REQUIRED",
+        active=True,
+    )
+    db.add(row)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_EXISTS") from exc
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_VOICE_CATALOG_CREATED",
+            resource_type="voice_catalog_entry",
+            resource_id=row.id,
+            outcome="SUCCESS",
+            metadata_json={
+                "provider_key": row.provider_key,
+                "provider_voice_id": row.provider_voice_id,
+                "curation_status": row.curation_status,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _admin_voice_catalog_payload(row)
+
+
+@router.post("/admin/voice-catalog/{voice_id}/curation")
+def admin_curate_voice_catalog_entry(
+    voice_id: str,
+    body: AdminVoiceCatalogCurationUpdate,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    row = db.get(VoiceCatalogEntry, voice_id)
+    if row is None:
+        raise HTTPException(404, "VOICE_CATALOG_ENTRY_NOT_FOUND")
+    if not row.active:
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_INACTIVE")
+    row.curation_status = body.curation_status
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_VOICE_CATALOG_CURATED",
+            resource_type="voice_catalog_entry",
+            resource_id=row.id,
+            outcome="SUCCESS",
+            metadata_json={
+                "curation_status": body.curation_status,
+                "evidence_ref": body.evidence_ref,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _admin_voice_catalog_payload(row)
+
+
+@router.post("/admin/voice-catalog/{voice_id}/deactivation")
+def admin_deactivate_voice_catalog_entry(
+    voice_id: str,
+    body: AdminVoiceCatalogDeactivateRequest,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    row = db.get(VoiceCatalogEntry, voice_id)
+    if row is None:
+        raise HTTPException(404, "VOICE_CATALOG_ENTRY_NOT_FOUND")
+    in_use = db.scalar(
+        select(AgentVoiceAssignment).where(
+            AgentVoiceAssignment.voice_catalog_id == row.id,
+            AgentVoiceAssignment.active.is_(True),
+        )
+    )
+    if in_use is not None:
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_IN_USE")
+    row.active = False
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_VOICE_CATALOG_DEACTIVATED",
+            resource_type="voice_catalog_entry",
+            resource_id=row.id,
+            outcome="SUCCESS",
+            metadata_json={"evidence_ref": body.evidence_ref},
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _admin_voice_catalog_payload(row)
+
+
+@router.post("/admin/voice-catalog/{voice_id}/preview")
+async def admin_preview_voice_catalog_entry(
+    voice_id: str,
+    body: AdminVoiceCatalogPreviewRequest,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    row = db.get(VoiceCatalogEntry, voice_id)
+    if row is None:
+        raise HTTPException(404, "VOICE_CATALOG_ENTRY_NOT_FOUND")
+    if not row.active:
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_INACTIVE")
+    if body.locale not in set(row.supported_locales or []):
+        raise HTTPException(422, "VOICE_LOCALE_NOT_SUPPORTED")
+    if "MESSAGE_PLAYBACK" not in set(row.delivery_modes or []):
+        raise HTTPException(422, "VOICE_DELIVERY_MODE_NOT_SUPPORTED")
+    profile = VoiceProfile(
+        agent_id="admin-preview",
+        binding_id=f"catalog-preview:{row.id}",
+        binding_version=row.catalog_version,
+        locale=body.locale,
+        provider=row.provider_key,
+        voice_id=row.provider_voice_id,
+        model=row.provider_model,
+        source_type=row.source_type,
+        delivery_mode="MESSAGE_PLAYBACK",
+        provider_profile_version=row.catalog_version,
+    )
+    try:
+        audio = await synthesize_speech(
+            settings,
+            profile,
+            body.text,
+            request_id=f"admin-voice-preview:{row.id}",
+        )
+    except TextToSpeechError as exc:
+        status = 503 if exc.code in {"TTS_DISABLED", "TTS_PROVIDER_UNAVAILABLE"} else 422
+        raise HTTPException(status, exc.code) from exc
+
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_VOICE_CATALOG_PREVIEWED",
+            resource_type="voice_catalog_entry",
+            resource_id=row.id,
+            outcome="SUCCESS",
+            metadata_json={
+                "locale": body.locale,
+                "chars": len(body.text),
+            },
+        )
+    )
+    db.commit()
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={
+            "X-Efata-Voice-Catalog-Id": row.id,
+            "X-Efata-Voice-Provider": row.provider_key,
+        },
+    )
 
 
 @router.get("/admin/agent-voice-assignments")
@@ -634,6 +926,47 @@ def admin_activate_agent_voice_assignment(
     return _admin_voice_assignment_payload(assignment, voice)
 
 
+@router.post("/admin/agent-voice-assignments/{assignment_id}/deactivation")
+def admin_deactivate_agent_voice_assignment(
+    assignment_id: str,
+    body: AdminVoiceAssignmentDeactivationRequest,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    _require_console_superadmin(p, settings)
+    assignment = _tenant_voice_assignment_or_404(
+        db,
+        tenant_id=p.tenant_id,
+        assignment_id=assignment_id,
+    )
+    if not assignment.active or assignment.assignment_state == "DISABLED":
+        raise HTTPException(409, "VOICE_ASSIGNMENT_ALREADY_DISABLED")
+    assignment.active = False
+    assignment.assignment_state = "DISABLED"
+    assignment.updated_by = p.user_id
+    voice = db.get(VoiceCatalogEntry, assignment.voice_catalog_id)
+    if voice is None:
+        raise HTTPException(409, "VOICE_CATALOG_ENTRY_NOT_FOUND")
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_AGENT_VOICE_ASSIGNMENT_DEACTIVATED",
+            resource_type="agent_voice_assignment",
+            resource_id=assignment.id,
+            outcome="SUCCESS",
+            metadata_json={
+                "agent_slug": assignment.agent_slug,
+                "evidence_ref": body.evidence_ref,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(assignment)
+    return _admin_voice_assignment_payload(assignment, voice)
+
+
 @router.get("/admin/teams")
 def admin_teams(
     p: Principal = Depends(require_provisioned_superadmin),
@@ -805,7 +1138,7 @@ def _history(
 def health(settings: Settings=Depends(get_settings)):
     return {"status":"ok","release":"2.0.0a1","sha":settings.release_sha,"environment":settings.environment}
 
-EXPECTED_MIGRATION_HEAD = "012_platform_user_invitations"
+EXPECTED_MIGRATION_HEAD = "013_agent_studio_control_plane"
 
 
 @router.get("/ready")

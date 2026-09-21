@@ -20,6 +20,7 @@ from .public_applications import router as public_applications_router
 from .knowledge_routes import router as knowledge_router
 from .billing.routes import router as billing_router
 from .platform_invitation_routes import router as platform_invitation_router
+from .agent_studio_routes import router as agent_studio_router
 from .public_activation_security import PublicActivationSecurityMiddleware
 from .provenance import runtime_provenance_payload
 
@@ -47,6 +48,7 @@ app.include_router(public_applications_router)
 app.include_router(knowledge_router)
 app.include_router(billing_router)
 app.include_router(platform_invitation_router)
+app.include_router(agent_studio_router)
 logger.info("PUBLIC_APPLICATIONS_RUNTIME_LOADED=true cors_origins=%s", _allowed_origins)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 

@@ -278,6 +278,10 @@ async def message_voice(
             "idempotency_replay": idempotency_replay,
             "cache_hit": cache_hit,
             "duration_ms": duration_ms,
+            "chars": len(message.content),
+            "provider": profile.provider,
+            "model": profile.model,
+            "voice_id": profile.voice_id,
         },
     )
     tts_logger.info(

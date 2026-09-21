@@ -64,6 +64,48 @@ def _catalog_profile(agent_id: str, locale: str, settings: Settings, *, delivery
     return VoiceProfile(agent_id=agent_id, binding_id=f"admin:{assignment.id}", binding_version=str(assignment.version), locale=locale, provider=entry.provider_key, voice_id=entry.provider_voice_id, model=entry.provider_model, source_type="CURATED_PRESET", delivery_mode=delivery_mode, provider_profile_version="catalog")
 
 
+def tenant_has_eligible_voice_output(
+    db: Session | None,
+    *,
+    tenant_id: str | None,
+    locale: str = "pt-BR",
+    delivery_mode: str = "REALTIME_STREAM",
+    provider: str | None = None,
+) -> bool:
+    """Return whether the tenant has at least one governed ACTIVE + VALIDATED voice.
+
+    This is a readiness probe only. Exact agent selection is still validated by
+    resolve_voice_profile() before a Realtime call or TTS synthesis starts.
+    """
+    if db is None or not tenant_id:
+        return False
+    bind = db.get_bind()
+    inspector = inspect(bind)
+    if not inspector.has_table("agent_voice_assignments") or not inspector.has_table("voice_catalog_entries"):
+        return False
+    rows = db.execute(
+        select(AgentVoiceAssignment, VoiceCatalogEntry)
+        .join(VoiceCatalogEntry, VoiceCatalogEntry.id == AgentVoiceAssignment.voice_catalog_id)
+        .where(
+            AgentVoiceAssignment.tenant_id == tenant_id,
+            AgentVoiceAssignment.active.is_(True),
+            AgentVoiceAssignment.assignment_state == "ACTIVE",
+            AgentVoiceAssignment.validation_status == "VALIDATED",
+            VoiceCatalogEntry.active.is_(True),
+            VoiceCatalogEntry.curation_status == "APPROVED",
+        )
+    ).all()
+    for assignment, entry in rows:
+        if provider and entry.provider_key != provider:
+            continue
+        if locale not in set(entry.supported_locales or []):
+            continue
+        if delivery_mode not in set(entry.delivery_modes or []):
+            continue
+        return True
+    return False
+
+
 def resolve_voice_profile(
     agent_id: str,
     locale: str,

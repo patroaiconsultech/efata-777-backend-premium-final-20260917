@@ -522,7 +522,7 @@ def test_alembic_has_one_effective_head_and_legacy_claim_is_not_in_graph():
     cfg = Config(str(root / "alembic.ini"))
     cfg.set_main_option("script_location", str(root / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["012_platform_user_invitations"]
+    assert script.get_heads() == ["013_agent_studio_control_plane"]
     revisions = {revision.revision for revision in script.walk_revisions()}
     assert "005_legacy_claim_on_demand" not in revisions
     assert not (root / "005_legacy_claim_on_demand.py").exists()

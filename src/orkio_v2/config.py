@@ -291,6 +291,7 @@ class Settings(BaseSettings):
     tts_message_rate_limit_per_minute: int = Field(4, alias="PLATFORM_TTS_MESSAGE_RATE_LIMIT_PER_MINUTE")
     tts_cache_enabled: bool = Field(True, alias="PLATFORM_TTS_CACHE_ENABLED")
     tts_cache_path: str = Field("./data/tts-cache", alias="PLATFORM_TTS_CACHE_PATH")
+    tts_cost_per_1m_chars_usd: float = Field(0.0, alias="PLATFORM_TTS_COST_PER_1M_CHARS_USD")
 
     realtime_bridge_enabled: bool = Field(False, alias="PLATFORM_REALTIME_BRIDGE_ENABLED")
     realtime_transcription_model: str = Field(
@@ -558,6 +559,8 @@ class Settings(BaseSettings):
             raise ValueError("TTS_RATE_LIMIT_INVALID")
         if not self.tts_cache_path.strip():
             raise ValueError("TTS_CACHE_PATH_REQUIRED")
+        if self.tts_cost_per_1m_chars_usd < 0:
+            raise ValueError("TTS_COST_RATE_INVALID")
         if self.large_document_pipeline_enabled:
             if self.knowledge_large_document_max_upload_bytes <= 0:
                 raise ValueError("KNOWLEDGE_MAX_UPLOAD_BYTES_INVALID")

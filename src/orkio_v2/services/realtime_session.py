@@ -10,6 +10,7 @@ from ..config import Settings
 from ..runtime.contracts import CanonicalTurnContext
 from ..runtime.realtime import realtime_identity_from_turn
 from .llm_providers import DEFAULT_OPENAI_BASE
+from .voice_binding import tenant_has_eligible_voice_output
 
 
 DEFAULT_REALTIME_MODEL = "gpt-realtime"
@@ -29,16 +30,35 @@ class RealtimeCallResult:
     output_modalities: tuple[str, ...]
 
 
-def realtime_capability(settings: Settings) -> dict[str, object]:
+def realtime_capability(
+    settings: Settings,
+    *,
+    db=None,
+    tenant_id: str | None = None,
+) -> dict[str, object]:
     key_configured = bool((settings.openai_api_key or "").strip())
     provider_openai = (settings.voice_provider or "").strip().casefold() == "openai"
     session_configured = bool(settings.voice_enabled and provider_openai and key_configured)
     bridge_configured = bool(session_configured and settings.realtime_bridge_enabled)
     bindings_configured = (settings.voice_bindings_json or "{}").strip() not in {"", "{}"}
+    governed_voice_configured = tenant_has_eligible_voice_output(
+        db,
+        tenant_id=tenant_id,
+        locale="pt-BR",
+        delivery_mode="REALTIME_STREAM",
+        provider=settings.tts_provider if settings.tts_provider != "disabled" else None,
+    )
+    tts_binding_source = (
+        "admin_assignment"
+        if governed_voice_configured
+        else "legacy_env"
+        if bindings_configured
+        else "none"
+    )
     tts_configured = bool(
         settings.tts_enabled
         and settings.tts_provider != "disabled"
-        and bindings_configured
+        and (governed_voice_configured or bindings_configured)
     )
 
     if not settings.voice_enabled:
@@ -90,6 +110,7 @@ def realtime_capability(settings: Settings) -> dict[str, object]:
                 if tts_configured
                 else "AGENT_VOICE_BINDING_NOT_VALIDATED"
             ),
+            "binding_source": tts_binding_source,
         },
         "voice_segment_streaming": {
             "status": "CONFIGURED" if bridge_configured and tts_configured else "DISABLED",

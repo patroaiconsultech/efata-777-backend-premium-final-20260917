@@ -11,7 +11,7 @@ def test_migration_graph_head_is_011_billing_wallet():
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["012_platform_user_invitations"]
+    assert script.get_heads() == ["013_agent_studio_control_plane"]
 
 
 def test_migration_009_is_defensive_and_postgres_immutable():
