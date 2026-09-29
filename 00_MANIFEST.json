@@ -1,0 +1,57 @@
+{
+  "baseline_backend_zip": {
+    "filename": "efata-777-backend-premium-final-20260917-main (11).zip",
+    "sha256": "b6817abb5c97471323d4373b0c552e2cce63d4874774d309227423588167a032"
+  },
+  "candidate_sealed": false,
+  "commit_executed": false,
+  "date": "2026-09-29",
+  "delta": {
+    "added": [],
+    "deleted": [],
+    "modified": [
+      "src/orkio_v2/services/llm_contracts.py",
+      "src/orkio_v2/services/llm_providers.py",
+      "tests/test_llm_observability_contract.py"
+    ],
+    "summary": "+0 / ~3 / -0"
+  },
+  "deploy_executed": false,
+  "merge_executed": false,
+  "not_included_or_changed": [
+    "src/orkio_v2/routes.py",
+    "src/orkio_v2/config.py",
+    "frontend",
+    "db/migrations",
+    "timeout",
+    "retry",
+    "failover",
+    "provider"
+  ],
+  "parent_sha256": {
+    "src/orkio_v2/services/llm_contracts.py": "b8453459e42a078712e757c669cab76dce6af3ef6b3b6712d740c127a4f49b52",
+    "src/orkio_v2/services/llm_providers.py": "9f9d9426f253a4d845eeab0e61202cbe86a830c740ca99c6ab330e42bbe865fe",
+    "tests/test_llm_observability_contract.py": "9908810233b61e45a1cd04284a3569f7a2ff78b9aabd1cb5f9855ec5bd93940a"
+  },
+  "pr_executed": false,
+  "product": "EFATA 777",
+  "production_runtime_binding": {
+    "branch": "main",
+    "deployment_id": "110c1ce9-a1b7-46f4-beb5-49f20bbc6928",
+    "git_commit_sha": "e1936b3de950e977ebd454d109122c832e3474372",
+    "patch_parent_product_files_match_runtime": true,
+    "repository": "patroaiconsultech/efata-777-backend-premium-final-20260917"
+  },
+  "purpose": "GITHUB_UPLOAD_3_FILES_ONLY",
+  "qualification": {
+    "behavioral_abc": "3/3 PASS",
+    "canonical_single_process_full_suite": "OPEN_NOT_EXECUTED_IN_THIS_RUNNER",
+    "delta_py_compile": "3/3 PASS",
+    "focused_llm_sse": "31/31 PASS"
+  },
+  "target_sha256": {
+    "src/orkio_v2/services/llm_contracts.py": "a90453de1441d5aa6438d619158dfff6a571fe95b42e1bb7466ba47b02c1aea1",
+    "src/orkio_v2/services/llm_providers.py": "179a9aca9f932a1353f820ed7d9f6d5e8e15418634ea8aa0aa555e9d787bd96f",
+    "tests/test_llm_observability_contract.py": "db80ae2e2cf8887e03d3dd2d8c001f2d9f1998ac67214dc254cfa5fa24101543"
+  }
+}

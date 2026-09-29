@@ -117,6 +117,11 @@ def _provider_error(
     operation: str,
     exc: Exception,
     elapsed_ms: int | None = None,
+    provider_headers_ms: int | None = None,
+    first_content_chunk_ms: int | None = None,
+    last_content_chunk_ms: int | None = None,
+    content_chunk_count: int | None = None,
+    effective_timeout_seconds: float | None = None,
 ) -> LLMUpstreamError:
     """Normalize upstream failures without retaining secrets, prompts, or raw bodies."""
     status: int | None = None
@@ -178,6 +183,11 @@ def _provider_error(
         rate_limit_scope=rate_limit_scope,
         exception_type=type(exc).__name__,
         elapsed_ms=elapsed_ms,
+        provider_headers_ms=provider_headers_ms,
+        first_content_chunk_ms=first_content_chunk_ms,
+        last_content_chunk_ms=last_content_chunk_ms,
+        content_chunk_count=content_chunk_count,
+        effective_timeout_seconds=effective_timeout_seconds,
     )
 
 
@@ -266,6 +276,14 @@ class OpenAIProvider:
     async def stream(self, agent: str, history: list[dict]) -> AsyncIterator[str]:
         key = self.ensure_configured()
         started_at = time.monotonic()
+        provider_headers_ms: int | None = None
+        first_content_chunk_ms: int | None = None
+        last_content_chunk_ms: int | None = None
+        content_chunk_count = 0
+
+        def elapsed_ms() -> int:
+            return max(0, int((time.monotonic() - started_at) * 1000))
+
         try:
             async with httpx.AsyncClient(timeout=self.settings.llm_http_timeout_seconds) as client:
                 async with client.stream(
@@ -274,6 +292,7 @@ class OpenAIProvider:
                     headers={"Authorization": f"Bearer {key}"},
                     json=openai_payload(self.settings, agent, history, stream=True),
                 ) as response:
+                    provider_headers_ms = elapsed_ms()
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if not line or not line.startswith("data: "):
@@ -288,6 +307,11 @@ class OpenAIProvider:
                         for choice in chunk.get("choices") or []:
                             piece = str((choice.get("delta") or {}).get("content") or "")
                             if piece:
+                                observed_ms = elapsed_ms()
+                                if first_content_chunk_ms is None:
+                                    first_content_chunk_ms = observed_ms
+                                last_content_chunk_ms = observed_ms
+                                content_chunk_count += 1
                                 yield piece
         except LLMNotConfigured:
             raise
@@ -297,7 +321,12 @@ class OpenAIProvider:
                 model=self.model,
                 operation="stream",
                 exc=exc,
-                elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                elapsed_ms=elapsed_ms(),
+                provider_headers_ms=provider_headers_ms,
+                first_content_chunk_ms=first_content_chunk_ms,
+                last_content_chunk_ms=last_content_chunk_ms,
+                content_chunk_count=content_chunk_count,
+                effective_timeout_seconds=float(self.settings.llm_http_timeout_seconds),
             ) from exc
 
     async def healthcheck(self) -> ProviderHealth:

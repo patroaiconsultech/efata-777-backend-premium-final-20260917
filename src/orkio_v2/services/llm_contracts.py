@@ -37,6 +37,11 @@ class LLMUpstreamError(RuntimeError):
         rate_limit_scope: str | None = None,
         exception_type: str | None = None,
         elapsed_ms: int | None = None,
+        provider_headers_ms: int | None = None,
+        first_content_chunk_ms: int | None = None,
+        last_content_chunk_ms: int | None = None,
+        content_chunk_count: int | None = None,
+        effective_timeout_seconds: float | None = None,
     ):
         super().__init__(code)
         self.code = code
@@ -52,6 +57,11 @@ class LLMUpstreamError(RuntimeError):
         self.rate_limit_scope = rate_limit_scope
         self.exception_type = exception_type
         self.elapsed_ms = elapsed_ms
+        self.provider_headers_ms = provider_headers_ms
+        self.first_content_chunk_ms = first_content_chunk_ms
+        self.last_content_chunk_ms = last_content_chunk_ms
+        self.content_chunk_count = content_chunk_count
+        self.effective_timeout_seconds = effective_timeout_seconds
 
     def diagnostic(self) -> dict[str, object]:
         """Return only non-secret metadata suitable for structured logs."""
@@ -68,6 +78,11 @@ class LLMUpstreamError(RuntimeError):
             "rate_limit_scope": self.rate_limit_scope,
             "exception_type": self.exception_type,
             "elapsed_ms": self.elapsed_ms,
+            "provider_headers_ms": self.provider_headers_ms,
+            "first_content_chunk_ms": self.first_content_chunk_ms,
+            "last_content_chunk_ms": self.last_content_chunk_ms,
+            "content_chunk_count": self.content_chunk_count,
+            "effective_timeout_seconds": self.effective_timeout_seconds,
         }
 
 
