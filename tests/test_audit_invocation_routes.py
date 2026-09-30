@@ -225,3 +225,53 @@ def test_malformed_directive_route_limiter_honors_policy_limit(monkeypatch):
     assert limiter.consume(tenant_id="tenant-config", user_id="user-config") is True
     assert limiter.consume(tenant_id="tenant-config", user_id="user-config") is False
 
+def test_chat_sse_disallowed_runtime_module_emits_error_then_done_without_llm(client, monkeypatch, caplog):
+    """Regression for the production-reproduced architecture_indexer failure path."""
+    _enable_audit(monkeypatch)
+    monkeypatch.setenv("PLATFORM_SSE_DELIVERY_TRACE_ENABLED", "true")
+    caplog.set_level(20, logger="uvicorn.error.orkio.sse_delivery")
+    called = {"stream": 0}
+
+    async def must_not_stream(*args, **kwargs):
+        called["stream"] += 1
+        yield "forbidden"
+
+    monkeypatch.setattr(llm, "stream", must_not_stream)
+    thread_id = _thread(client)
+    response = client.post(
+        f"/api/v2/threads/{thread_id}/stream",
+        json={
+            "content": '/audit {"version":"1","operation":"runtime.file_sha256","module_id":"architecture_indexer"}',
+            "agent": "Natã",
+        },
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    events = [
+        line.removeprefix("event: ").strip()
+        for line in response.text.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert events == ["error", "done"]
+    assert '"code": "AUDIT_RUNTIME_MODULE_NOT_ALLOWED"' in response.text
+    assert '"status": "failed"' in response.text
+    assert called["stream"] == 0
+
+    trace_logs = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "uvicorn.error.orkio.sse_delivery"
+    )
+    assert '"event_names":["error"]' in trace_logs
+    assert '"event_names":["done"]' in trace_logs
+    assert '"status":"failed"' in trace_logs
+    assert "architecture_indexer" not in trace_logs
+
+    with Testing() as db:
+        row = db.scalar(select(AuditEvidenceRecord))
+        assert row is not None
+        assert row.status == "failed"
+        assert row.error_code == "AUDIT_RUNTIME_MODULE_NOT_ALLOWED"
+        assert row.envelope_json["read_executed"] is True
+

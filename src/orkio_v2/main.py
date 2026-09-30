@@ -22,6 +22,7 @@ from .billing.routes import router as billing_router
 from .platform_invitation_routes import router as platform_invitation_router
 from .agent_studio_routes import router as agent_studio_router
 from .public_activation_security import PublicActivationSecurityMiddleware
+from .sse_delivery_trace import SSEDeliveryTraceMiddleware
 from .provenance import runtime_provenance_payload
 
 settings=get_settings()
@@ -97,6 +98,10 @@ async def csrf_middleware(request: Request, call_next):
         )
     return response
 
+
+# Last-added middleware is outermost in Starlette's user middleware stack.
+# This trace is disabled by default and observes only canonical thread SSE delivery.
+app.add_middleware(SSEDeliveryTraceMiddleware)
 
 @app.on_event("startup")
 def startup():
