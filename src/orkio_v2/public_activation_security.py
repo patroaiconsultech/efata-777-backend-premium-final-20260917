@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
+from .services.activation_rate_limit import RedisRateLimitUnavailable, check_external_activation_rate_limit
 
 
 STATUS_PATH = "/api/v2/platform-invitations/status"
@@ -222,6 +223,27 @@ def _replay_receive(messages: list[Message]) -> Receive:
     return receive
 
 
+def _token_from_messages(messages: list[Message]) -> str | None:
+    body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message.get("type") == "http.request"
+    )
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    return token or None
+
+
 class PublicActivationSecurityMiddleware:
     def __init__(self, app: ASGIApp):
         self.app = app
@@ -259,33 +281,73 @@ class PublicActivationSecurityMiddleware:
 
         client_ip = resolve_client_ip(scope, settings)
         backend = settings.platform_activation_rate_limit_backend
-        if backend != "memory":
-            await _json_response(scope, send, 503, "PUBLIC_ACTIVATION_RATE_LIMIT_BACKEND_UNAVAILABLE")
-            return
-
         limit = (
             settings.platform_activation_status_rate_limit_per_window
             if endpoint_class == "status"
             else settings.platform_activation_accept_rate_limit_per_window
         )
-        decision = _memory_limiter.check(
-            f"{endpoint_class}|{client_ip}",
-            limit=limit,
-            window_seconds=settings.platform_activation_rate_limit_window_seconds,
-        )
-        if not decision.allowed:
+
+        if backend == "memory":
+            decision = _memory_limiter.check(
+                f"{endpoint_class}|{client_ip}",
+                limit=limit,
+                window_seconds=settings.platform_activation_rate_limit_window_seconds,
+            )
+            if not decision.allowed:
+                await _json_response(
+                    scope,
+                    send,
+                    429,
+                    "PUBLIC_ACTIVATION_RATE_LIMITED",
+                    retry_after=decision.retry_after_seconds,
+                )
+                return
+
+            messages, _, too_large = await _buffer_bounded_body(receive, max_bytes)
+            if too_large:
+                await _json_response(scope, send, 413, "PUBLIC_ACTIVATION_PAYLOAD_TOO_LARGE")
+                return
+        elif backend == "external":
+            messages, _, too_large = await _buffer_bounded_body(receive, max_bytes)
+            if too_large:
+                await _json_response(scope, send, 413, "PUBLIC_ACTIVATION_PAYLOAD_TOO_LARGE")
+                return
+
+            token = _token_from_messages(messages)
+            try:
+                decision = await check_external_activation_rate_limit(
+                    endpoint_class=endpoint_class,
+                    client_ip=client_ip,
+                    token=token,
+                    secret=settings.platform_invitation_secret,
+                    limit=limit,
+                    window_seconds=settings.platform_activation_rate_limit_window_seconds,
+                )
+            except RedisRateLimitUnavailable:
+                await _json_response(
+                    scope,
+                    send,
+                    503,
+                    "PUBLIC_ACTIVATION_RATE_LIMIT_BACKEND_UNAVAILABLE",
+                )
+                return
+
+            if not decision.allowed:
+                await _json_response(
+                    scope,
+                    send,
+                    429,
+                    "PUBLIC_ACTIVATION_RATE_LIMITED",
+                    retry_after=decision.retry_after_seconds,
+                )
+                return
+        else:
             await _json_response(
                 scope,
                 send,
-                429,
-                "PUBLIC_ACTIVATION_RATE_LIMITED",
-                retry_after=decision.retry_after_seconds,
+                503,
+                "PUBLIC_ACTIVATION_RATE_LIMIT_BACKEND_UNAVAILABLE",
             )
-            return
-
-        messages, _, too_large = await _buffer_bounded_body(receive, max_bytes)
-        if too_large:
-            await _json_response(scope, send, 413, "PUBLIC_ACTIVATION_PAYLOAD_TOO_LARGE")
             return
 
         await self.app(scope, _replay_receive(messages), send)

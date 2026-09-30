@@ -14,6 +14,8 @@ from orkio_v2.public_activation_security import (
     reset_public_activation_security_state_for_tests,
     resolve_client_ip,
 )
+from orkio_v2.services.activation_rate_limit import DistributedRateLimitDecision
+import orkio_v2.public_activation_security as activation_security
 
 
 @pytest.fixture(autouse=True)
@@ -204,3 +206,93 @@ def test_invalid_trusted_proxy_cidr_rejected():
             PLATFORM_INVITATION_TOKEN_SECRET="x" * 40,
             PLATFORM_ACTIVATION_TRUSTED_PROXY_CIDRS="not-a-cidr",
         )
+
+
+def test_external_rate_limit_backend_uses_adapter_and_allows_request(monkeypatch):
+    _enable_invitation(
+        monkeypatch,
+        PLATFORM_ACTIVATION_RATE_LIMIT_BACKEND="external",
+    )
+    observed = {}
+
+    async def fake_check(**kwargs):
+        observed.update(kwargs)
+        return DistributedRateLimitDecision(True, 0)
+
+    monkeypatch.setattr(
+        activation_security,
+        "check_external_activation_rate_limit",
+        fake_check,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/platform-invitations/status",
+            json={"token": "x" * 40},
+        )
+
+    assert response.status_code == 404
+    assert observed["endpoint_class"] == "status"
+    assert observed["token"] == "x" * 40
+    assert observed["secret"] == "u" * 40
+    assert observed["limit"] == get_settings().platform_activation_status_rate_limit_per_window
+
+
+def test_external_rate_limit_backend_returns_429_with_retry_after(monkeypatch):
+    _enable_invitation(
+        monkeypatch,
+        PLATFORM_ACTIVATION_RATE_LIMIT_BACKEND="external",
+    )
+
+    async def fake_check(**kwargs):
+        return DistributedRateLimitDecision(False, 9)
+
+    monkeypatch.setattr(
+        activation_security,
+        "check_external_activation_rate_limit",
+        fake_check,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/platform-invitations/status",
+            json={"token": "x" * 40},
+        )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "PUBLIC_ACTIVATION_RATE_LIMITED"
+    assert response.headers["Retry-After"] == "9"
+
+def test_external_rate_limit_backend_malformed_redis_url_returns_controlled_503(monkeypatch):
+    _enable_invitation(
+        monkeypatch,
+        PLATFORM_ACTIVATION_RATE_LIMIT_BACKEND="external",
+        REDIS_URL="redis://localhost:notaport/0",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/platform-invitations/status",
+            json={"token": "x" * 40},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "PUBLIC_ACTIVATION_RATE_LIMIT_BACKEND_UNAVAILABLE"
+
+
+
+def test_external_rate_limit_backend_malformed_redis_ipv6_url_returns_controlled_503(monkeypatch):
+    _enable_invitation(
+        monkeypatch,
+        PLATFORM_ACTIVATION_RATE_LIMIT_BACKEND="external",
+        REDIS_URL="redis://[::1",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/platform-invitations/status",
+            json={"token": "x" * 40},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "PUBLIC_ACTIVATION_RATE_LIMIT_BACKEND_UNAVAILABLE"
