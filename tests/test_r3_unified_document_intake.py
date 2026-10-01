@@ -1,4 +1,5 @@
 from __future__ import annotations
+from types import SimpleNamespace
 
 from pathlib import Path
 import json
@@ -404,6 +405,7 @@ def test_r3_team_runtime_passes_latest_user_query_to_document_context(
             thread_id=thread_id,
             tenant_id="tenant-1",
             settings=get_settings(),
+            participant=SimpleNamespace(history_access="full_thread", joined_at=None),
         )
 
     assert captured["query_text"] == "Pergunta financeira de governança para o Team"

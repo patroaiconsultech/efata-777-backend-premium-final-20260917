@@ -16,7 +16,7 @@ from .config import Settings, get_settings
 from .database import get_db
 from .models import AuditEvent, Message, ThreadRole
 from .routes import thread_access
-from .services.identity import require_provisioned_principal
+from .services.identity import require_thread_principal
 from .services.text_to_speech import (
     TextToSpeechError,
     complete_tts_idempotency,
@@ -30,6 +30,7 @@ from .services.text_to_speech import (
     write_cached_speech,
 )
 from .services.voice_binding import VoiceBindingError, resolve_voice_profile
+from .services.thread_access_policy import visible_message_by_id
 
 
 router = APIRouter(prefix="/api/v2", tags=["tts"])
@@ -149,7 +150,7 @@ async def message_voice(
     payload: MessageVoiceRequest,
     x_request_id: str | None = Header(None, alias="X-Request-Id"),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_thread_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
@@ -163,13 +164,15 @@ async def message_voice(
     if not settings.tts_enabled:
         raise HTTPException(503, detail=_detail("TTS_DISABLED"))
 
-    message = db.get(Message, message_id)
+    message = visible_message_by_id(
+        db,
+        message_id=message_id,
+        thread_id=thread_id,
+        tenant_id=p.tenant_id,
+        participant=member,
+    )
     if not message:
         raise HTTPException(404, detail=_detail("MESSAGE_NOT_FOUND"))
-    if message.tenant_id != p.tenant_id:
-        raise HTTPException(404, detail=_detail("MESSAGE_NOT_FOUND"))
-    if message.thread_id != thread_id:
-        raise HTTPException(409, detail=_detail("MESSAGE_THREAD_MISMATCH"))
     if message.author_type != "agent":
         raise HTTPException(422, detail=_detail("MESSAGE_NOT_AGENT_AUTHORED"))
     if not message.content.strip():

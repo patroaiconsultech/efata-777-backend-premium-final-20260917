@@ -18,6 +18,11 @@ from .direct_runtime import envelope_payload, history_item
 from .document_context import document_context_message
 from .platform_knowledge import system_capability_guard_message
 from .knowledge_retrieval import knowledge_context_messages
+from .thread_access_policy import (
+    ThreadAccessPolicyError,
+    require_thread_access as require_canonical_thread_access,
+    visible_messages,
+)
 
 
 
@@ -265,22 +270,17 @@ def build_team_plan(
 
 
 def assert_team_thread_access(db: Session, *, thread_id: str, principal):
-    thread = db.get(Thread, thread_id)
-    if thread is None or thread.tenant_id != principal.tenant_id:
-        raise TeamContractError("THREAD_NOT_FOUND")
-    member = db.scalar(
-        select(ThreadParticipant).where(
-            ThreadParticipant.thread_id == thread_id,
-            ThreadParticipant.tenant_id == principal.tenant_id,
-            ThreadParticipant.user_id == principal.user_id,
-            ThreadParticipant.active.is_(True),
+    try:
+        decision = require_canonical_thread_access(
+            db,
+            thread_id=thread_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            require_write=True,
         )
-    )
-    if member is None:
-        raise TeamContractError("THREAD_ACCESS_DENIED")
-    if member.thread_role not in TEAM_ALLOWED_THREAD_ROLES:
-        raise TeamContractError("THREAD_READ_ONLY")
-    return thread, member
+    except ThreadAccessPolicyError as exc:
+        raise TeamContractError(exc.code) from exc
+    return decision.thread, decision.participant
 
 
 def team_history(
@@ -289,20 +289,23 @@ def team_history(
     thread_id: str,
     tenant_id: str,
     settings,
+    participant: ThreadParticipant,
     limit: int = 40,
     user_id: str | None = None,
     execution_id: str | None = None,
     agent_id: str | None = None,
     purpose: str = "team",
 ) -> list[dict]:
-    rows = db.scalars(
-        select(Message)
-        .where(Message.thread_id == thread_id, Message.tenant_id == tenant_id)
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-    ).all()
+    rows = visible_messages(
+        db,
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        participant=participant,
+        limit=limit,
+        newest_first=True,
+    )
     ordered = list(reversed(rows))
-    history = [history_item(row) for row in ordered]
+    history = [history_item(row, current_user_id=user_id) for row in ordered]
     latest_user_content = next(
         (str(row.content or "") for row in reversed(ordered) if row.author_type == "user"),
         "",

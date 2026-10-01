@@ -48,6 +48,7 @@ def project_direct_history(
     messages: Iterable[Message],
     *,
     turn_owner_agent_id: str | None,
+    current_user_id: str | None = None,
 ) -> DirectHistoryProjection:
     """Project persisted thread history without lending another agent the owner's assistant role.
 
@@ -65,7 +66,7 @@ def project_direct_history(
 
     for message in messages:
         if message.author_type != "agent":
-            projected.append(history_item(message))
+            projected.append(history_item(message, current_user_id=current_user_id))
             user_count += 1
             continue
 

@@ -538,6 +538,10 @@ def requested_repositories_from_message(settings: Settings, message: str) -> tup
         selected.extend(repo for repo in allowed if "backend" in repo.casefold())
     if "frontend" in low:
         selected.extend(repo for repo in allowed if "frontend" in repo.casefold())
+    if re.search(r"\befat[aà]\b", low):
+        # A platform self-analysis request is explicit enough to inspect the
+        # server-configured allowlist, while remaining bounded/read-only.
+        selected.extend(allowed)
     if (
         ("github" in low and any(token in low for token in ("código", "codigo", "repo", "reposit")))
         or "código da plataforma" in low

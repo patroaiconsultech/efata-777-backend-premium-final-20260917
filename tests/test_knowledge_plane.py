@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -461,6 +462,7 @@ def test_chat_and_team_history_share_governed_retrieval(db, tmp_path):
         "thread-shared",
         "tenant-a",
         cfg,
+        SimpleNamespace(history_access="full_thread", joined_at=datetime.now(timezone.utc)),
         user_id="user-a",
         execution_id="exec-chat",
         agent_id="orkio",
@@ -471,6 +473,7 @@ def test_chat_and_team_history_share_governed_retrieval(db, tmp_path):
         thread_id="thread-shared",
         tenant_id="tenant-a",
         settings=cfg,
+        participant=SimpleNamespace(history_access="full_thread", joined_at=datetime.now(timezone.utc)),
         user_id="user-a",
         execution_id="exec-team",
         agent_id="orkio",
@@ -894,6 +897,7 @@ def test_chat_history_separates_immutable_system_guard_from_governed_platform(
         "thread-platform-governance",
         "tenant-a",
         settings(tmp_path),
+        SimpleNamespace(history_access="full_thread", joined_at=datetime.now(timezone.utc)),
         user_id="user-a",
         execution_id="exec-platform-governance",
         agent_id="orkio",

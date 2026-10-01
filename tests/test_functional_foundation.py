@@ -55,9 +55,27 @@ def test_unprovisioned_principal_is_forbidden(client):
     assert response.json()["detail"] == "PRINCIPAL_NOT_PROVISIONED"
 
 
-def test_user_without_membership_is_forbidden(client):
-    """user-2 existe mas não tem membership: acesso negado."""
-    response = client.get("/api/v2/threads", headers=headers(user="user-2", roles="member"))
+def test_user_without_membership_or_thread_grant_is_forbidden(client):
+    """Identidade conhecida sem Membership nem external_guest ativo é negada."""
+    with Testing() as db:
+        if not db.get(User, "user-no-grant"):
+            db.add(
+                User(
+                    id="user-no-grant",
+                    external_subject="sub-no-grant",
+                    email="no-grant@example.com",
+                    display_name="No Grant",
+                )
+            )
+            db.commit()
+    response = client.get(
+        "/api/v2/threads",
+        headers=headers(
+            user="user-no-grant",
+            roles="admin",
+            subject="sub-no-grant",
+        ),
+    )
     assert response.status_code == 403
     assert response.json()["detail"] == "PRINCIPAL_NOT_PROVISIONED"
 

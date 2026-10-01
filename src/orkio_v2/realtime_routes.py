@@ -21,7 +21,7 @@ from .models import AuditEvent, Message, Thread, ThreadParticipant, ThreadRole
 from .runtime.contracts import CanonicalTurnContext, RuntimeChannel
 from .services.direct_runtime import build_turn as build_direct_turn
 from .services.execution_router import resolve_direct_target_decision
-from .services.identity import require_provisioned_principal
+from .services.identity import require_collaboration_principal, require_thread_principal
 from .services.hyper_cocreator import is_allowlisted_admin
 from .services.realtime_bridge import (
     RealtimeBridgeError,
@@ -50,6 +50,10 @@ from .services.team_runtime import (
 )
 from .services.voice_binding import VoiceBindingError, resolve_voice_profile
 from .services.text_to_speech import TextToSpeechError, synthesize_speech
+from .services.thread_access_policy import (
+    ThreadAccessPolicyError,
+    require_thread_access as require_canonical_thread_access,
+)
 
 
 router = APIRouter(prefix="/api/v2", tags=["realtime"])
@@ -82,22 +86,17 @@ class RealtimeFinalTranscript(BaseModel):
 
 
 def _thread_access(db: Session, *, thread_id: str, principal: Principal) -> ThreadParticipant:
-    thread = db.get(Thread, thread_id)
-    if thread is None or thread.tenant_id != principal.tenant_id:
-        raise HTTPException(404, "THREAD_NOT_FOUND")
-    member = db.scalar(
-        select(ThreadParticipant).where(
-            ThreadParticipant.thread_id == thread_id,
-            ThreadParticipant.tenant_id == principal.tenant_id,
-            ThreadParticipant.user_id == principal.user_id,
-            ThreadParticipant.active.is_(True),
+    try:
+        decision = require_canonical_thread_access(
+            db,
+            thread_id=thread_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            require_write=True,
         )
-    )
-    if member is None:
-        raise HTTPException(403, "THREAD_ACCESS_DENIED")
-    if member.thread_role == ThreadRole.viewer.value:
-        raise HTTPException(403, "THREAD_READ_ONLY")
-    return member
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
+    return decision.participant
 
 
 def _audit(
@@ -243,7 +242,7 @@ def _raise_team_contract(exc: TeamContractError) -> None:
 
 @router.get("/realtime/capabilities")
 def realtime_capabilities(
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_collaboration_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
@@ -254,7 +253,7 @@ def realtime_capabilities(
 async def realtime_call(
     thread_id: str,
     payload: RealtimeCallCreate,
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_thread_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
@@ -576,7 +575,7 @@ def _enforce_realtime_segment_limits(
 async def realtime_stream_turn(
     thread_id: str,
     payload: RealtimeFinalTranscript,
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_thread_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
@@ -786,7 +785,7 @@ async def realtime_stream_turn(
 async def realtime_final_turn(
     thread_id: str,
     payload: RealtimeFinalTranscript,
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_thread_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):

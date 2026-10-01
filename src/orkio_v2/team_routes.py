@@ -14,7 +14,7 @@ from .auth import Principal
 from .config import Settings, get_settings
 from .database import get_db
 from .services import llm
-from .services.identity import require_provisioned_principal
+from .services.identity import require_collaboration_principal, require_thread_principal
 from .services.team_runtime import (
     TeamContractError,
     assert_team_thread_access,
@@ -30,6 +30,8 @@ from .services.team_runtime import (
 )
 from .runtime.events import RuntimeEvent, RuntimeEventType, validate_runtime_sequence
 from .services.execution_correlation import ExecutionCorrelation
+from .services.capability_plane import privileged_roles, runtime_capability_messages
+from .services.github_integration import github_context_messages
 
 
 router = APIRouter(prefix="/api/v2", tags=["team"])
@@ -67,7 +69,7 @@ def _raise_team_error(exc: TeamContractError):
 
 @router.get("/teams")
 def teams_catalog(
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_collaboration_principal),
     settings: Settings = Depends(get_settings),
 ):
     del p
@@ -81,12 +83,12 @@ def teams_catalog(
 async def stream_team_message(
     thread_id: str,
     payload: TeamMessageCreate,
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_thread_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
     try:
-        assert_team_thread_access(db, thread_id=thread_id, principal=p)
+        _, member = assert_team_thread_access(db, thread_id=thread_id, principal=p)
         plan = build_team_plan(
             team_id=payload.team_id,
             selection_mode=payload.selection_mode,
@@ -130,11 +132,41 @@ async def stream_team_message(
     )
 
     persist_user_message(db, turn=turn, content=payload.content)
-    base_history = team_history(
+
+    github_messages = await github_context_messages(
+        settings,
+        message=payload.content,
+        is_admin=privileged_roles(p.roles),
+    )
+    capability_messages = await runtime_capability_messages(
+        message=payload.content,
+        roles=p.roles,
+        tenant_id=p.tenant_id,
+        user_id=p.user_id,
+        thread_id=thread_id,
+        agent_id=turn.turn_owner_agent_id,
+        request_id=turn.execution_id,
+        db=db,
+    )
+    evidence_messages = list(github_messages) + list(capability_messages)
+    team_audit(
+        db,
+        turn=turn,
+        action="team_evidence_preflight",
+        outcome="completed",
+        metadata={
+            "github_context_messages": len(github_messages),
+            "capability_context_messages": len(capability_messages),
+            "evidence_context_messages": len(evidence_messages),
+        },
+    )
+
+    base_history = evidence_messages + team_history(
         db,
         thread_id=thread_id,
         tenant_id=p.tenant_id,
         settings=settings,
+        participant=member,
         user_id=p.user_id,
         execution_id=turn.execution_id,
         agent_id=turn.turn_owner_agent_id,

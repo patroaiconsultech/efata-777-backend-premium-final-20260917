@@ -69,10 +69,24 @@ def persist_agent_response(
     return row, envelope
 
 
-def history_item(message: Message) -> dict[str, str]:
-    """Return LLM history while preserving the canonical agent speaker."""
+def history_item(
+    message: Message,
+    *,
+    current_user_id: str | None = None,
+) -> dict[str, str]:
+    """Return LLM history while preserving collaborative human authorship.
+
+    The current principal already occupies the canonical ``user`` role, so its
+    text stays byte-for-byte compatible with existing prompt contracts. Human
+    messages authored by another collaborator carry an explicit, low-authority
+    identity prefix so the model never collapses all people into one speaker.
+    """
     if message.author_type != "agent":
-        return {"role": "user", "content": message.content}
+        human_id = str(message.author_id or "").strip() or "unknown"
+        content = message.content
+        if not current_user_id or human_id != current_user_id:
+            content = f"[HumanUser id:{human_id}] {content}"
+        return {"role": "user", "content": content}
 
     speaker = (message.agent_name or message.author_id or "Agent").strip()
     return {

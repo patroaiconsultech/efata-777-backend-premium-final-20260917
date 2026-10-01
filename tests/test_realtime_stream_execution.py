@@ -27,6 +27,11 @@ async def test_stream_realtime_direct_emits_segments_before_terminal_commit():
         patch.object(realtime_execution, "resolve_direct_target_decision", return_value=decision),
         patch.object(realtime_execution, "build_direct_turn", return_value=turn),
         patch.object(realtime_execution, "persist_user_message"),
+        patch.object(
+            realtime_execution,
+            "_realtime_participant",
+            return_value=SimpleNamespace(history_access="full_thread", joined_at=None),
+        ),
         patch.object(realtime_execution, "team_history", return_value=[]),
         patch.object(
             realtime_execution,
