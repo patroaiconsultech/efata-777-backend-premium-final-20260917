@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterable
@@ -446,11 +447,165 @@ def _priority_paths(tree_paths: Iterable[str], repository: str) -> tuple[str, ..
     return tuple(path for path in candidates if path in tree)
 
 
+_QUERY_STOPWORDS = {
+    "a", "ao", "aos", "as", "da", "das", "de", "do", "dos", "e", "em",
+    "na", "nas", "no", "nos", "o", "os", "para", "por", "que", "qual",
+    "quais", "um", "uma", "the", "a", "an", "and", "of", "to", "for",
+    "in", "on", "with", "which", "what", "current", "atual", "hoje",
+    "arquivo", "arquivos", "file", "files", "backend", "frontend", "premium",
+}
+
+_QUERY_CONCEPT_ALIASES: dict[str, set[str]] = {
+    "thread": {"thread", "threads", "conversa", "conversas"},
+    "access": {
+        "access", "acesso", "acessos", "acl", "authorization", "authorize",
+        "autorizacao", "autorizar", "permission", "permissions", "permissao",
+        "permissoes",
+    },
+    "policy": {"policy", "politica", "canonical", "canonica", "canonico"},
+    "team": {"team", "equipe", "equipes"},
+    "route": {
+        "route", "routes", "router", "endpoint", "stream", "preflight",
+        "fanout", "fan-out",
+    },
+    "runtime": {"runtime", "execution", "execucao", "executor"},
+    "evidence": {"evidence", "evidencia", "evidencias", "provenance", "source_ref"},
+    "github": {"github"},
+    "integration": {
+        "integration", "integracao", "integracoes", "acquisition", "aquisicao",
+        "readonly", "read-only",
+    },
+    "repository": {"repository", "repositories", "repositorio", "repositorios", "repo", "repos"},
+}
+
+
+def _normalized_query_tokens(value: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    ascii_value = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    raw_tokens = re.findall(r"[a-z0-9_]+", ascii_value.casefold().replace("-", " "))
+    tokens: set[str] = set()
+    for token in raw_tokens:
+        if token in _QUERY_STOPWORDS or len(token) < 2:
+            continue
+        tokens.add(token)
+        if token.endswith("s") and len(token) > 3:
+            tokens.add(token[:-1])
+    return tokens
+
+
+def _query_concepts(message: str) -> set[str]:
+    tokens = _normalized_query_tokens(message)
+    concepts = set(tokens)
+    for concept, aliases in _QUERY_CONCEPT_ALIASES.items():
+        if tokens.intersection(aliases):
+            concepts.add(concept)
+    return concepts
+
+
+def _path_concepts(path: str) -> set[str]:
+    tokens = _normalized_query_tokens(path.replace("/", " "))
+    concepts = set(tokens)
+    for concept, aliases in _QUERY_CONCEPT_ALIASES.items():
+        if tokens.intersection(aliases):
+            concepts.add(concept)
+    return concepts
+
+
+def _targeted_paths_for_message(
+    message: str,
+    tree_paths: Iterable[str],
+    *,
+    limit: int = 4,
+) -> tuple[str, ...]:
+    """Select bounded, query-relevant safe-text paths before generic snapshot files.
+
+    This is intentionally deterministic and tree-only: it never executes repository
+    content and never expands authority beyond the already allowlisted repository.
+    """
+    if limit <= 0:
+        return ()
+
+    tree = tuple(tree_paths)
+    tree_set = set(tree)
+    query = _query_concepts(message)
+    if not query:
+        return ()
+
+    selected: list[str] = []
+
+    # Current-platform canonical hints close the proven HP001 gap where the generic
+    # snapshot exhausted its character budget before reaching the implementation
+    # named by the user's question. Hints are accepted only when the path is present
+    # in the observed tree and passes the same path safety policy as normal reads.
+    canonical_hints: list[tuple[bool, str]] = [
+        (
+            {"thread", "access"}.issubset(query),
+            "src/orkio_v2/services/thread_access_policy.py",
+        ),
+        (
+            "team" in query and bool(query.intersection({"route", "evidence", "runtime"})),
+            "src/orkio_v2/team_routes.py",
+        ),
+        (
+            {"github", "integration"}.issubset(query)
+            or ("github" in query and "repository" in query),
+            "src/orkio_v2/services/github_integration.py",
+        ),
+    ]
+    for enabled, path in canonical_hints:
+        if not enabled or path not in tree_set or path in selected:
+            continue
+        try:
+            _safe_path(path)
+        except GitHubPathRejected:
+            continue
+        selected.append(path)
+        if len(selected) >= limit:
+            return tuple(selected)
+
+    scored: list[tuple[int, int, str]] = []
+    for path in tree:
+        if path in selected:
+            continue
+        try:
+            safe = _safe_path(path)
+        except GitHubPathRejected:
+            continue
+        concepts = _path_concepts(safe)
+        overlap = query.intersection(concepts)
+        score = len(overlap)
+
+        # Stronger confidence for multi-concept implementation names.
+        if {"thread", "access"}.issubset(query) and {"thread", "access"}.issubset(concepts):
+            score += 4
+        if {"github", "integration"}.issubset(query) and {"github", "integration"}.issubset(concepts):
+            score += 4
+        if "team" in query and "team" in concepts:
+            if "route" in concepts and query.intersection({"route", "evidence"}):
+                score += 3
+            if "runtime" in concepts and "runtime" in query:
+                score += 2
+
+        # Require at least two independent relevance signals for generic ranking.
+        if score < 2:
+            continue
+        depth = safe.count("/")
+        scored.append((score, -depth, safe))
+
+    for _score, _depth, path in sorted(scored, key=lambda item: (-item[0], item[1], item[2])):
+        if path not in selected:
+            selected.append(path)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
 async def repository_snapshot(
     settings: Settings,
     repository: str,
     *,
     requested_paths: Iterable[str] = (),
+    query_message: str = "",
 ) -> RepositorySnapshot:
     head = await repository_head(settings, repository)
     tree_paths, truncated = await repository_tree(
@@ -465,6 +620,14 @@ async def repository_snapshot(
             raise GitHubPathRejected("GITHUB_PATH_NOT_IN_SNAPSHOT")
         if safe not in selected:
             selected.append(safe)
+    remaining_target_slots = max(settings.github_snapshot_max_files - len(selected), 0)
+    for path in _targeted_paths_for_message(
+        query_message,
+        tree_paths,
+        limit=min(3, remaining_target_slots),
+    ):
+        if path not in selected:
+            selected.append(path)
     for path in _priority_paths(tree_paths, head.repository):
         if len(selected) >= settings.github_snapshot_max_files:
             break
@@ -643,7 +806,11 @@ async def github_context_messages(
     messages: list[dict[str, str]] = []
     for repository in requested[:2]:
         try:
-            snapshot = await repository_snapshot(settings, repository)
+            snapshot = await repository_snapshot(
+                settings,
+                repository,
+                query_message=message,
+            )
         except GitHubIntegrationError as exc:
             messages.append({
                 "role": "system",
