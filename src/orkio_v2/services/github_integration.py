@@ -686,9 +686,72 @@ _REPO_ANALYSIS_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PLATFORM_SELF_KNOWLEDGE_CONCEPTS = frozenset({
+    "thread",
+    "access",
+    "policy",
+    "team",
+    "route",
+    "runtime",
+    "evidence",
+    "integration",
+    "repository",
+})
+
+_PLATFORM_SELF_KNOWLEDGE_TOKENS = frozenset({
+    "arquitetura",
+    "architecture",
+    "seguranca",
+    "security",
+    "identidade",
+    "identity",
+    "billing",
+    "database",
+    "banco",
+    "schema",
+    "migracao",
+    "migration",
+    "deploy",
+    "deployment",
+    "runtime",
+    "agente",
+    "agent",
+    "llm",
+    "api",
+    "knowledge",
+    "conhecimento",
+    "web",
+})
+
+
+def _platform_self_knowledge_requested(message: str) -> bool:
+    """Recognize bounded natural-language questions about EFATÀ internals.
+
+    Explicit repository-analysis terms remain the primary trigger. This helper
+    only closes the proven Direct-mode gap where a user asks about the current
+    EFATÀ platform itself without saying "GitHub", "repo", "código" or
+    "analise". It does not broaden repository authority: downstream allowlist,
+    admin authorization and read-only enforcement remain unchanged.
+    """
+    tokens = _normalized_query_tokens(message or "")
+    if "efata" not in tokens:
+        return False
+
+    concepts = _query_concepts(message or "")
+    technical_concepts = concepts.intersection(_PLATFORM_SELF_KNOWLEDGE_CONCEPTS)
+    if len(technical_concepts) >= 2:
+        return True
+
+    return bool(tokens.intersection(_PLATFORM_SELF_KNOWLEDGE_TOKENS))
+
 
 def requested_repositories_from_message(settings: Settings, message: str) -> tuple[str, ...]:
-    if not settings.github_enabled or not _REPO_ANALYSIS_RE.search(message or ""):
+    if not settings.github_enabled:
+        return ()
+    if not (
+        _REPO_ANALYSIS_RE.search(message or "")
+        or _platform_self_knowledge_requested(message)
+    ):
         return ()
     allowed = allowed_repositories(settings)
     low = (message or "").casefold()
