@@ -30,14 +30,6 @@ logger = logging.getLogger("orkio.public_applications")
 app=FastAPI(title="PatroAI Platform API",docs_url="/docs" if settings.environment!="production" else None)
 
 _allowed_origins = [x.strip() for x in settings.allowed_origins.split(",") if x.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-ORKIO-CSRF", "Idempotency-Key"],
-    expose_headers=["X-ORKIO-CSRF", "X-Request-ID"],
-)
 app.add_middleware(PublicActivationSecurityMiddleware)
 app.include_router(auth_router)
 app.include_router(router)
@@ -105,9 +97,21 @@ async def csrf_middleware(request: Request, call_next):
     return response
 
 
-# Last-added middleware is outermost in Starlette's user middleware stack.
 # This trace is disabled by default and observes only canonical thread SSE delivery.
 app.add_middleware(SSEDeliveryTraceMiddleware)
+
+# Last-added middleware is outermost in Starlette's user middleware stack.
+# CORS must wrap application-level security middleware so even fail-closed
+# CSRF responses remain readable by an allowed browser origin. Without this,
+# browsers surface a synthetic network error instead of the real 403 detail.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-ORKIO-CSRF", "Idempotency-Key"],
+    expose_headers=["X-ORKIO-CSRF", "X-Request-ID"],
+)
 
 @app.on_event("startup")
 def startup():
