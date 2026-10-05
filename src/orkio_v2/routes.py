@@ -253,14 +253,10 @@ def me(
     db: Session = Depends(get_db),
 ):
     profile = profile_for(db, tenant_id=p.tenant_id, user_id=p.user_id)
-    user_display_name = db.scalar(
-        select(User.display_name).where(User.id == p.user_id)
-    )
     return {
         "user_id": p.user_id,
         "tenant_id": p.tenant_id,
         "email": p.email,
-        "display_name": user_display_name,
         "roles": list(p.roles),
         "admin_access": is_allowlisted_admin(p, settings),
         "co_creator_name": (
@@ -625,6 +621,43 @@ def admin_deactivate_voice_catalog_entry(
             tenant_id=p.tenant_id,
             actor_id=p.user_id,
             action="ADMIN_VOICE_CATALOG_DEACTIVATED",
+            resource_type="voice_catalog_entry",
+            resource_id=row.id,
+            outcome="SUCCESS",
+            metadata_json={"evidence_ref": body.evidence_ref},
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _admin_voice_catalog_payload(row)
+
+
+@router.post("/admin/voice-catalog/{voice_id}/activation")
+def admin_activate_voice_catalog_entry(
+    voice_id: str,
+    body: AdminVoiceCatalogDeactivateRequest,
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
+    """Reactivate a previously deactivated catalog entry.
+
+    Activation only restores the catalog entry's availability. It does not
+    create or reactivate any agent assignment; assignment validation and
+    activation remain separate governed gates.
+    """
+    _require_console_superadmin(p, settings)
+    row = db.get(VoiceCatalogEntry, voice_id)
+    if row is None:
+        raise HTTPException(404, "VOICE_CATALOG_ENTRY_NOT_FOUND")
+    if row.active:
+        return _admin_voice_catalog_payload(row)
+    row.active = True
+    db.add(
+        AuditEvent(
+            tenant_id=p.tenant_id,
+            actor_id=p.user_id,
+            action="ADMIN_VOICE_CATALOG_ACTIVATED",
             resource_type="voice_catalog_entry",
             resource_id=row.id,
             outcome="SUCCESS",
@@ -1422,33 +1455,9 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
 def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
     thread_access(db,thread_id,p)
     rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==p.tenant_id).order_by(Message.created_at)).all()
-    human_author_ids = {
-        m.author_id
-        for m in rows
-        if m.author_type == "user" and m.author_id
-    }
-    human_author_names: dict[str, str] = {}
-    if human_author_ids:
-        author_rows = db.execute(
-            select(User.id, User.display_name)
-            .join(ThreadParticipant, ThreadParticipant.user_id == User.id)
-            .where(
-                ThreadParticipant.tenant_id == p.tenant_id,
-                ThreadParticipant.thread_id == thread_id,
-                User.id.in_(human_author_ids),
-            )
-        ).all()
-        human_author_names = {
-            str(user_id): str(display_name)
-            for user_id, display_name in author_rows
-            if user_id and display_name
-        }
     return [{
         "id":m.id,
         "author_type":m.author_type,
-        "author_id":m.author_id,
-        "user_id":m.author_id if m.author_type=="user" else None,
-        "author_display_name":human_author_names.get(m.author_id) if m.author_type=="user" else None,
         "agent_id":m.author_id if m.author_type=="agent" else None,
         "agent_name":m.agent_name,
         "content":m.content,

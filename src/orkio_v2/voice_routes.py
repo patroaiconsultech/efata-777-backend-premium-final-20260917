@@ -250,8 +250,15 @@ _JOSUE_CEDAR_OPERATOR_HTML = r"""<!doctype html>
     );
     if (matches.length > 1) throw new Error("MULTIPLE_CEDAR_CATALOG_ENTRIES");
     if (matches.length === 1) {
-      validateCedar(matches[0]);
-      return matches[0];
+      let existing = matches[0];
+      if (!existing.active) {
+        existing = await api(`/api/v2/admin/voice-catalog/${encodeURIComponent(existing.id)}/activation`, {
+          method: "POST",
+          body: {evidence_ref: `reactivate-web-pilot:${new Date().toISOString()}`}
+        });
+      }
+      validateCedar(existing);
+      return existing;
     }
     const created = await api("/api/v2/admin/voice-catalog", {
       method: "POST",
