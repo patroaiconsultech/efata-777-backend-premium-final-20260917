@@ -835,3 +835,96 @@ def test_openapi_publishes_canonical_billing_contract():
     assert "/api/v2/billing/wallet/ledger" in paths
     assert "/api/v2/billing/webhooks/asaas" in paths
     assert "/api/v2/billing/admin/summary" in paths
+
+
+def test_provider_webhook_is_csrf_exempt_but_still_provider_authenticated(
+    client,
+    monkeypatch,
+):
+    from orkio_v2.config import get_settings
+    import orkio_v2.main as main_module
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "environment", "staging", raising=False)
+    monkeypatch.setattr(settings, "asaas_webhook_token", "w" * 32, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "billing_webhook_max_body_bytes",
+        1024,
+        raising=False,
+    )
+    assert main_module.settings is settings
+
+    # A normal state-changing browser endpoint still requires CSRF.
+    protected = client.post(
+        "/api/v2/billing/checkouts",
+        json={"item_code": "founder_access", "checkout_kind": "plan"},
+        headers={
+            "X-Test-User": "user-1",
+            "X-Test-Tenant": "tenant-1",
+            "X-Test-Roles": "admin",
+            "X-Test-Email": "owner@example.com",
+            "X-Test-Subject": "sub-1",
+        },
+    )
+    assert protected.status_code == 403
+    assert protected.json()["detail"] == "CSRF_TOKEN_INVALID"
+
+    # Provider webhooks do not carry browser CSRF cookies. The narrow exemption
+    # lets the request reach provider authentication, which still fails closed.
+    unauthenticated = client.post(
+        "/api/v2/billing/webhooks/asaas",
+        json={"id": "evt-route-missing-token", "event": "PAYMENT_CONFIRMED"},
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["detail"] == "BILLING_WEBHOOK_TOKEN_INVALID"
+
+    authenticated = client.post(
+        "/api/v2/billing/webhooks/asaas",
+        headers={"asaas-access-token": "w" * 32},
+        json={
+            "id": "evt-route-valid-token",
+            "event": "PAYMENT_CONFIRMED",
+            "payment": {
+                "id": "pay-route-unknown",
+                "paymentLink": "plink-route-unknown",
+            },
+        },
+    )
+    assert authenticated.status_code == 200
+    assert authenticated.json() == {"ok": True, "ignored": True}
+
+
+def test_provider_webhook_body_is_bounded_before_json_processing(client, monkeypatch):
+    from orkio_v2.config import get_settings
+    import orkio_v2.main as main_module
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "environment", "staging", raising=False)
+    monkeypatch.setattr(settings, "asaas_webhook_token", "w" * 32, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "billing_webhook_max_body_bytes",
+        64,
+        raising=False,
+    )
+    assert main_module.settings is settings
+
+    response = client.post(
+        "/api/v2/billing/webhooks/asaas",
+        headers={
+            "asaas-access-token": "w" * 32,
+            "content-type": "application/json",
+        },
+        content=b'{"payload":"' + (b"x" * 128) + b'"}',
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"] == "BILLING_WEBHOOK_BODY_TOO_LARGE"
+
+
+def test_billing_webhook_body_limit_configuration_is_bounded():
+    with pytest.raises(
+        ValueError,
+        match="BILLING_WEBHOOK_MAX_BODY_BYTES_INVALID",
+    ):
+        billing_settings(PLATFORM_BILLING_WEBHOOK_MAX_BODY_BYTES=10_485_761)

@@ -23,6 +23,28 @@ from . import repository, service
 router = APIRouter(prefix="/api/v2/billing", tags=["billing"])
 
 
+async def _read_bounded_webhook_body(request: Request, *, max_bytes: int) -> bytes:
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            declared_bytes = int(declared)
+        except ValueError as exc:
+            raise HTTPException(400, "BILLING_WEBHOOK_CONTENT_LENGTH_INVALID") from exc
+        if declared_bytes < 0:
+            raise HTTPException(400, "BILLING_WEBHOOK_CONTENT_LENGTH_INVALID")
+        if declared_bytes > max_bytes:
+            raise HTTPException(413, "BILLING_WEBHOOK_BODY_TOO_LARGE")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(413, "BILLING_WEBHOOK_BODY_TOO_LARGE")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _raise(exc: Exception) -> None:
     if isinstance(exc, service.BillingDomainError):
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
@@ -136,8 +158,11 @@ async def asaas_webhook(
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    raw = await request.body()
     token = (request.headers.get("asaas-access-token") or "").strip()
+    raw = await _read_bounded_webhook_body(
+        request,
+        max_bytes=settings.billing_webhook_max_body_bytes,
+    )
     try:
         return service.process_asaas_webhook(
             db,

@@ -48,7 +48,7 @@ A autenticação **first-party permanece fora deste release**. O pacote premium 
 | `PLATFORM_ARTIFACT_STORAGE_ENDPOINT_URL` | S3-compatible | HTTPS; vazio para AWS S3 nativo |
 | `PLATFORM_ARTIFACT_STORAGE_ACCESS_KEY_ID` | S3 | Secret; nunca commitar |
 | `PLATFORM_ARTIFACT_STORAGE_SECRET_ACCESS_KEY` | S3 | Secret; nunca commitar |
-| `PLATFORM_ARTIFACT_STORAGE_SSE` | S3 | `AES256` ou `aws:kms` |
+| `PLATFORM_ARTIFACT_STORAGE_SSE` | S3 | `AES256`, `aws:kms` ou `provider`; use `provider` quando o S3-compatible rejeita headers SSE do cliente (ex.: Cloudflare R2) |
 | `PLATFORM_ARTIFACT_STORAGE_KMS_KEY_ID` | SSE-KMS | Obrigatório quando SSE=`aws:kms` |
 | `PLATFORM_ARTIFACT_STORAGE_PREFIX` | S3 | Prefixo sem `..`, por exemplo `efata/production` |
 | `PLATFORM_ARTIFACT_STORAGE_PATH` | Local | `./data/artifacts`; não usar para produção |

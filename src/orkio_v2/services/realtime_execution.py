@@ -14,7 +14,7 @@ from .direct_runtime import (
     persist_agent_response,
 )
 from .execution_router import resolve_direct_target_decision
-from .hyper_cocreator import hyper_cocreator_system_message, profile_for
+from .hyper_cocreator import hyper_cocreator_profile_message, hyper_cocreator_system_message, profile_for
 from .github_integration import github_context_messages
 from .internal_consultation import (
     build_internal_consultation_context,
@@ -29,10 +29,6 @@ from .team_runtime import (
     team_history,
 )
 from .realtime_segmenter import SentenceSegmenter
-from .thread_access_policy import (
-    ThreadAccessPolicyError,
-    require_thread_access as require_canonical_thread_access,
-)
 
 
 class RealtimeExecutionError(RuntimeError):
@@ -90,25 +86,6 @@ def _unexpected_execution_error(
     )
 
 
-def _realtime_participant(
-    db: Session,
-    *,
-    tenant_id: str,
-    user_id: str,
-    thread_id: str,
-):
-    try:
-        return require_canonical_thread_access(
-            db,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            require_write=True,
-        ).participant
-    except ThreadAccessPolicyError as exc:
-        raise RealtimeExecutionError(exc.code, stage="thread_access") from exc
-
-
 @dataclass(frozen=True, slots=True)
 class RealtimeExecutionResult:
     message_id: str
@@ -130,12 +107,6 @@ async def execute_realtime_direct(
     transcript: str,
     is_admin: bool = False,
 ) -> RealtimeExecutionResult:
-    participant = _realtime_participant(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        thread_id=thread_id,
-    )
     try:
         decision = resolve_direct_target_decision(f"id:{agent_id}", settings)
     except Exception as exc:
@@ -164,7 +135,6 @@ async def execute_realtime_direct(
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
-            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
@@ -201,6 +171,13 @@ async def execute_realtime_direct(
             history.insert(
                 0,
                 hyper_cocreator_system_message(
+                    co_creator_name=profile.co_creator_name if profile else None,
+                    onboarding_goal=profile.onboarding_goal if profile else None,
+                ),
+            )
+            history.insert(
+                1,
+                hyper_cocreator_profile_message(
                     co_creator_name=profile.co_creator_name if profile else None,
                     onboarding_goal=profile.onboarding_goal if profile else None,
                 ),
@@ -271,12 +248,6 @@ async def execute_realtime_team(
     contributor_agent_ids: tuple[str, ...],
     transcript: str,
 ) -> RealtimeExecutionResult:
-    participant = _realtime_participant(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        thread_id=thread_id,
-    )
     plan = build_team_plan(
         team_id=team_id,
         settings=settings,
@@ -306,7 +277,6 @@ async def execute_realtime_team(
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
-            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
@@ -434,12 +404,6 @@ async def stream_realtime_direct(
     generator owns the canonical LLM response and emits speech segments before
     the final assistant message is persisted.
     """
-    participant = _realtime_participant(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        thread_id=thread_id,
-    )
     try:
         requested_target = agent_id if agent_id.startswith("id:") else f"id:{agent_id}"
         decision = resolve_direct_target_decision(requested_target, settings)
@@ -457,7 +421,6 @@ async def stream_realtime_direct(
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
-            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
@@ -490,6 +453,13 @@ async def stream_realtime_direct(
             history.insert(
                 0,
                 hyper_cocreator_system_message(
+                    co_creator_name=profile.co_creator_name if profile else None,
+                    onboarding_goal=profile.onboarding_goal if profile else None,
+                ),
+            )
+            history.insert(
+                1,
+                hyper_cocreator_profile_message(
                     co_creator_name=profile.co_creator_name if profile else None,
                     onboarding_goal=profile.onboarding_goal if profile else None,
                 ),

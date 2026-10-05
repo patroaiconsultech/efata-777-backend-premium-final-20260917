@@ -21,6 +21,7 @@ class FakeS3Client:
     def __init__(self):
         self.objects: dict[tuple[str, str], bytes] = {}
         self.puts: list[dict] = []
+        self.uploads: list[dict] = []
 
     def head_object(self, *, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -30,6 +31,18 @@ class FakeS3Client:
     def put_object(self, **kwargs):
         self.puts.append(kwargs)
         self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
+
+    def upload_fileobj(self, source, bucket, key, *, ExtraArgs):
+        payload = source.read()
+        self.uploads.append(
+            {
+                "Bucket": bucket,
+                "Key": key,
+                "Body": payload,
+                "ExtraArgs": dict(ExtraArgs),
+            }
+        )
+        self.objects[(bucket, key)] = payload
 
     def get_object(self, *, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -77,6 +90,48 @@ def test_s3_storage_uses_prefix_and_sse_kms(monkeypatch):
     storage.delete("tenant/thread/a.txt")
     with pytest.raises(BlobStorageError, match="BLOB_NOT_FOUND"):
         storage.get("tenant/thread/a.txt")
+
+
+def test_s3_storage_provider_managed_encryption_omits_sse_headers(monkeypatch, tmp_path: Path):
+    client = FakeS3Client()
+    storage = S3BlobStorage(
+        bucket="efata-r2",
+        region="auto",
+        endpoint_url="https://example.r2.cloudflarestorage.com",
+        access_key_id="access",
+        secret_access_key="fixture-key",
+        prefix="efata-prod",
+        server_side_encryption="provider",
+        kms_key_id="",
+    )
+    monkeypatch.setattr(S3BlobStorage, "_client", lambda self: client)
+
+    assert storage.put_if_absent("tenant/thread/a.txt", b"hello", content_type="text/plain")
+    assert "ServerSideEncryption" not in client.puts[0]
+    assert "SSEKMSKeyId" not in client.puts[0]
+
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"payload")
+    assert storage.put_file_if_absent(
+        "tenant/thread/artifact.bin",
+        source,
+        content_type="application/octet-stream",
+    )
+    extra_args = client.uploads[0]["ExtraArgs"]
+    assert extra_args == {"ContentType": "application/octet-stream"}
+
+
+def test_s3_settings_accept_provider_managed_encryption():
+    settings = Settings(
+        PLATFORM_ARTIFACT_STORAGE_BACKEND="s3",
+        PLATFORM_ARTIFACT_STORAGE_BUCKET="efata-r2",
+        PLATFORM_ARTIFACT_STORAGE_REGION="auto",
+        PLATFORM_ARTIFACT_STORAGE_ENDPOINT_URL="https://example.r2.cloudflarestorage.com",
+        PLATFORM_ARTIFACT_STORAGE_ACCESS_KEY_ID="access",
+        PLATFORM_ARTIFACT_STORAGE_SECRET_ACCESS_KEY="fixture-key",
+        PLATFORM_ARTIFACT_STORAGE_SSE="provider",
+    )
+    assert settings.artifact_storage_sse == "provider"
 
 
 def test_production_requires_durable_storage():

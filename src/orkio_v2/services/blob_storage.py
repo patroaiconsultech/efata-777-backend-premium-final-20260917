@@ -141,6 +141,14 @@ class S3BlobStorage:
             aws_secret_access_key=self.secret_access_key,
         )
 
+    def _encryption_args(self) -> dict[str, str]:
+        if self.server_side_encryption == "provider":
+            return {}
+        args = {"ServerSideEncryption": self.server_side_encryption}
+        if self.server_side_encryption == "aws:kms":
+            args["SSEKMSKeyId"] = self.kms_key_id
+        return args
+
     def put_if_absent(self, key: str, data: bytes, *, content_type: str) -> bool:
         client = self._client()
         object_key = self._key(key)
@@ -158,10 +166,8 @@ class S3BlobStorage:
                 "Key": object_key,
                 "Body": data,
                 "ContentType": content_type,
-                "ServerSideEncryption": self.server_side_encryption,
+                **self._encryption_args(),
             }
-            if self.server_side_encryption == "aws:kms":
-                put_kwargs["SSEKMSKeyId"] = self.kms_key_id
             client.put_object(**put_kwargs)
         except Exception as exc:
             raise BlobStorageError("BLOB_WRITE_FAILED") from exc
@@ -180,10 +186,8 @@ class S3BlobStorage:
                 raise BlobStorageError("BLOB_HEAD_FAILED") from exc
         extra_args = {
             "ContentType": content_type,
-            "ServerSideEncryption": self.server_side_encryption,
+            **self._encryption_args(),
         }
-        if self.server_side_encryption == "aws:kms":
-            extra_args["SSEKMSKeyId"] = self.kms_key_id
         try:
             with path.open("rb") as source:
                 client.upload_fileobj(source, self.bucket, object_key, ExtraArgs=extra_args)

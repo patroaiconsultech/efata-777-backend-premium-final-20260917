@@ -18,6 +18,7 @@ from orkio_v2.runtime.orchestration import (
 from orkio_v2.services.internal_consultation import (
     INTERNAL_SPECIALIST_ALLOWLIST,
     build_internal_consultation_context,
+    internal_contribution_messages,
     select_internal_consultations,
 )
 
@@ -108,6 +109,9 @@ async def test_internal_consultation_returns_hidden_owner_preserving_contributio
     assert contributions[0].source_agent_id == "orion"
     assert contributions[0].target_turn_owner_agent_id == "orkio"
     assert contributions[0].tenant_id == "tenant-1"
+    context = internal_contribution_messages(contributions)
+    assert context[0]["role"] == "user"
+    assert "INTERNAL_CONTRIBUTION_DATA" in context[0]["content"]
 
 
 def test_internal_consultation_is_disabled_by_default():

@@ -11,19 +11,18 @@ from .config import Settings, get_settings
 from .database import Base, get_db, engine
 from .models import *
 from .schemas import *
-from .services.invitations import create_invitation, accept_invitation, revoke_participant
+from .services.invitations import create_invitation, accept_invitation
 from .services.identity import (
     require_provisioned_principal,
     require_provisioned_admin,
     require_provisioned_superadmin,
     require_known_principal,
-    require_collaboration_principal,
-    require_thread_principal,
     assert_provisioned,
 )
 from .services.hyper_cocreator import (
     AccessGateError,
     complete_onboarding,
+    hyper_cocreator_profile_message,
     hyper_cocreator_system_message,
     is_allowlisted_admin,
     profile_for,
@@ -57,11 +56,6 @@ from .services.direct_runtime import (
 from .services.conversation_history_policy import (
     DIRECT_HISTORY_POLICY_VERSION,
     project_direct_history,
-)
-from .services.thread_access_policy import (
-    ThreadAccessPolicyError,
-    require_thread_access as require_canonical_thread_access,
-    visible_messages,
 )
 from .runtime.contracts import RuntimeChannel
 from .runtime.events import RuntimeEvent, RuntimeEventType, validate_runtime_sequence
@@ -1060,23 +1054,19 @@ def _effective_agent_target(requested_target: str, p: Principal) -> str:
 INVITE_ALLOWED_ROLES={ThreadRole.owner.value, ThreadRole.moderator.value}
 
 def thread_access(db: Session, thread_id: str, p: Principal) -> tuple[Thread, ThreadParticipant]:
-    try:
-        decision = require_canonical_thread_access(
-            db,
-            thread_id=thread_id,
-            tenant_id=p.tenant_id,
-            user_id=p.user_id,
-        )
-    except ThreadAccessPolicyError as exc:
-        raise HTTPException(exc.status_code, exc.code) from exc
-    return decision.thread, decision.participant
+    thread=db.get(Thread, thread_id)
+    if not thread or thread.tenant_id != p.tenant_id: raise HTTPException(404, "THREAD_NOT_FOUND")
+    member=db.scalar(select(ThreadParticipant).where(
+        ThreadParticipant.thread_id==thread_id, ThreadParticipant.user_id==p.user_id,
+        ThreadParticipant.active.is_(True)))
+    if not member: raise HTTPException(403, "THREAD_ACCESS_DENIED")
+    return thread, member
 
 def _history(
     db: Session,
     thread_id: str,
     tenant_id: str,
     settings: Settings,
-    participant: ThreadParticipant,
     limit: int = 40,
     extra_system_messages: list[dict[str, str]] | None = None,
     *,
@@ -1085,19 +1075,12 @@ def _history(
     agent_id: str | None = None,
     purpose: str = "chat",
 ) -> list[dict]:
-    rows = visible_messages(
-        db,
-        thread_id=thread_id,
-        tenant_id=tenant_id,
-        participant=participant,
-        limit=limit,
-        newest_first=True,
-    )
+    rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==tenant_id)
+                    .order_by(Message.created_at.desc()).limit(limit)).all()
     ordered=list(reversed(rows))
     projection=project_direct_history(
         ordered,
         turn_owner_agent_id=agent_id,
-        current_user_id=user_id,
     )
     history=list(projection.messages)
     history_policy_logger.info(
@@ -1392,7 +1375,7 @@ def create_thread(payload: ThreadCreate, p: Principal=Depends(require_provisione
 def update_thread_title(
     thread_id: str,
     payload: ThreadTitleUpdate,
-    p: Principal = Depends(require_thread_principal),
+    p: Principal = Depends(require_provisioned_principal),
     db: Session = Depends(get_db),
 ):
     thread, member = thread_access(db, thread_id, p)
@@ -1408,7 +1391,7 @@ def update_thread_title(
     return {"id": thread.id, "title": thread.title}
 
 @router.get("/threads")
-def list_threads(p: Principal=Depends(require_collaboration_principal), db: Session=Depends(get_db),
+def list_threads(p: Principal=Depends(require_provisioned_principal), db: Session=Depends(get_db),
                  limit: int=Query(50, ge=1, le=200), offset: int=Query(0, ge=0)):
     """Lista apenas as threads do tenant nas quais o principal participa.
 
@@ -1432,19 +1415,12 @@ def list_threads(p: Principal=Depends(require_collaboration_principal), db: Sess
             "total":int(total),"limit":limit,"offset":offset}
 
 @router.get("/threads/{thread_id}/messages")
-def list_messages(thread_id: str,p:Principal=Depends(require_thread_principal),db:Session=Depends(get_db)):
-    _, member = thread_access(db,thread_id,p)
-    rows = visible_messages(
-        db,
-        thread_id=thread_id,
-        tenant_id=p.tenant_id,
-        participant=member,
-    )
+def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
+    thread_access(db,thread_id,p)
+    rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==p.tenant_id).order_by(Message.created_at)).all()
     return [{
         "id":m.id,
         "author_type":m.author_type,
-        "author_id":m.author_id,
-        "user_id":m.author_id if m.author_type=="user" else None,
         "agent_id":m.author_id if m.author_type=="agent" else None,
         "agent_name":m.agent_name,
         "content":m.content,
@@ -1452,7 +1428,7 @@ def list_messages(thread_id: str,p:Principal=Depends(require_thread_principal),d
     } for m in rows]
 
 @router.post("/threads/{thread_id}/messages")
-async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_thread_principal),
+async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_provisioned_principal),
                        settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     _,member=thread_access(db,thread_id,p)
     if member.thread_role==ThreadRole.viewer.value: raise HTTPException(403,"THREAD_READ_ONLY")
@@ -1548,12 +1524,18 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
                 onboarding_goal=profile.onboarding_goal if profile else None,
             ),
         )
+        runtime_system_messages.insert(
+            1,
+            hyper_cocreator_profile_message(
+                co_creator_name=profile.co_creator_name if profile else None,
+                onboarding_goal=profile.onboarding_goal if profile else None,
+            ),
+        )
     history=_history(
         db,
         thread_id,
         p.tenant_id,
         settings,
-        member,
         extra_system_messages=runtime_system_messages,
         user_id=p.user_id,
         execution_id=turn.execution_id,
@@ -1615,7 +1597,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     return response_payload
 
 @router.post("/threads/{thread_id}/stream")
-async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_thread_principal),
+async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_provisioned_principal),
                          settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     """SSE com contrato terminal garantido.
 
@@ -1764,6 +1746,13 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
                     onboarding_goal=profile.onboarding_goal if profile else None,
                 ),
             )
+            runtime_system_messages.insert(
+                1,
+                hyper_cocreator_profile_message(
+                    co_creator_name=profile.co_creator_name if profile else None,
+                    onboarding_goal=profile.onboarding_goal if profile else None,
+                ),
+            )
         if artifact_allowed and artifact_intent is not None:
             runtime_system_messages.append(
                 artifact_generation_system_message(artifact_intent)
@@ -1773,7 +1762,6 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             thread_id,
             tenant_id,
             settings,
-            member,
             extra_system_messages=runtime_system_messages,
             user_id=user_id,
             execution_id=turn.execution_id,
@@ -2024,7 +2012,7 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
                              headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
 @router.post("/threads/{thread_id}/invitations",response_model=InvitationOut)
-def invite(thread_id:str,payload:InvitationCreate,p:Principal=Depends(require_thread_principal),
+def invite(thread_id:str,payload:InvitationCreate,p:Principal=Depends(require_provisioned_principal),
            settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     thread,member=thread_access(db,thread_id,p)
     if member.thread_role not in INVITE_ALLOWED_ROLES:
@@ -2039,31 +2027,10 @@ def accept(payload:InvitationAccept,p:Principal=Depends(require_known_principal)
     return {"status":"accepted","thread_id":invitation.thread_id}
 
 @router.get("/threads/{thread_id}/participants")
-def participants(thread_id:str,p:Principal=Depends(require_thread_principal),db:Session=Depends(get_db)):
+def participants(thread_id:str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
     thread_access(db,thread_id,p)
     rows=db.scalars(select(ThreadParticipant).where(ThreadParticipant.thread_id==thread_id,ThreadParticipant.active.is_(True))).all()
     return [{"id":x.id,"user_id":x.user_id,"role":x.thread_role,"membership_type":x.membership_type} for x in rows]
-
-
-@router.post("/threads/{thread_id}/participants/{user_id}/revoke")
-def revoke_thread_participant(
-    thread_id: str,
-    user_id: str,
-    p: Principal = Depends(require_thread_principal),
-    db: Session = Depends(get_db),
-):
-    participant = revoke_participant(
-        db,
-        thread_id=thread_id,
-        target_user_id=user_id,
-        principal=p,
-    )
-    db.commit()
-    return {
-        "status": "revoked",
-        "thread_id": thread_id,
-        "user_id": participant.user_id,
-    }
 
 _THREAD_DOCUMENT_ALLOWED_MIME = {
     "application/pdf",

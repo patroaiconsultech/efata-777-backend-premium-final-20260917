@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from orkio_v2.config import get_settings
 from orkio_v2.database import get_db
 from orkio_v2.models import Attachment
+from orkio_v2.services.blob_storage import BlobStorageError
 from orkio_v2.services.document_context import (
     DocumentExtractionFailed,
     DocumentIntegrityError,
@@ -109,6 +110,8 @@ def test_context_is_tenant_and_thread_scoped(client, tmp_path, monkeypatch):
             thread_id="thread-a",
         )
         assert context is not None
+        assert context["role"] == "user"
+        assert "UNTRUSTED_DOCUMENT_CONTENT" in context["content"]
         assert "ONLY-THREAD-A-CAN-READ-THIS" in context["content"]
 
         assert document_context_message(
@@ -163,6 +166,128 @@ def test_sha_mismatch_is_reported_not_silently_ignored(client, tmp_path, monkeyp
         )
         assert context is not None
         assert "DOCUMENT_INTEGRITY_ERROR" in context["content"] or "DOCUMENT_SHA256_MISMATCH" in context["content"]
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
+
+
+class _RemoteOnlyBlobStorage:
+    def __init__(self, blobs: dict[str, bytes]) -> None:
+        self._blobs = blobs
+        self.get_calls: list[str] = []
+
+    def get(self, key: str) -> bytes:
+        self.get_calls.append(key)
+        try:
+            return self._blobs[key]
+        except KeyError as exc:
+            raise BlobStorageError("BLOB_NOT_FOUND") from exc
+
+
+def test_legacy_document_context_reads_attachment_through_blob_storage(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "artifact_storage_path", str(tmp_path), raising=False)
+    monkeypatch.setattr(settings, "document_context_enabled", True, raising=False)
+
+    data = b"REMOTE-R2-DOCUMENT-MARKER"
+    storage_key = "tenant-r2/thread-r2/reference.md"
+    digest = hashlib.sha256(data).hexdigest()
+    storage = _RemoteOnlyBlobStorage({storage_key: data})
+
+    monkeypatch.setattr(
+        "orkio_v2.services.document_context.build_blob_storage",
+        lambda _settings: storage,
+    )
+
+    dependency = client.app.dependency_overrides[get_db]
+    db_gen = dependency()
+    db: Session = next(db_gen)
+    try:
+        db.add(
+            Attachment(
+                id="att-r2",
+                tenant_id="tenant-r2",
+                thread_id="thread-r2",
+                uploaded_by="user-r2",
+                filename="reference.md",
+                mime_type="text/markdown",
+                size_bytes=len(data),
+                sha256=digest,
+                storage_key=storage_key,
+            )
+        )
+        db.commit()
+
+        context = document_context_message(
+            db,
+            settings=settings,
+            tenant_id="tenant-r2",
+            thread_id="thread-r2",
+        )
+
+        assert context is not None
+        assert context["role"] == "user"
+        assert "REMOTE-R2-DOCUMENT-MARKER" in context["content"]
+        assert storage_key in storage.get_calls
+        assert not (tmp_path / storage_key).exists()
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
+
+
+def test_legacy_document_context_maps_missing_blob_to_storage_missing(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "artifact_storage_path", str(tmp_path), raising=False)
+    monkeypatch.setattr(settings, "document_context_enabled", True, raising=False)
+
+    storage_key = "tenant-r2/thread-missing/missing.md"
+    storage = _RemoteOnlyBlobStorage({})
+    monkeypatch.setattr(
+        "orkio_v2.services.document_context.build_blob_storage",
+        lambda _settings: storage,
+    )
+
+    dependency = client.app.dependency_overrides[get_db]
+    db_gen = dependency()
+    db: Session = next(db_gen)
+    try:
+        db.add(
+            Attachment(
+                id="att-r2-missing",
+                tenant_id="tenant-r2",
+                thread_id="thread-missing",
+                uploaded_by="user-r2",
+                filename="missing.md",
+                mime_type="text/markdown",
+                size_bytes=7,
+                sha256=hashlib.sha256(b"missing").hexdigest(),
+                storage_key=storage_key,
+            )
+        )
+        db.commit()
+
+        context = document_context_message(
+            db,
+            settings=settings,
+            tenant_id="tenant-r2",
+            thread_id="thread-missing",
+        )
+
+        assert context is not None
+        assert "DOCUMENT_STORAGE_MISSING" in context["content"]
+        assert storage_key in storage.get_calls
     finally:
         try:
             next(db_gen)

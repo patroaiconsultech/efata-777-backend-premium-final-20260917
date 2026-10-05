@@ -183,7 +183,7 @@ class Settings(BaseSettings):
     artifact_storage_endpoint_url: str | None = Field(None, alias="PLATFORM_ARTIFACT_STORAGE_ENDPOINT_URL")
     artifact_storage_access_key_id: str = Field("", alias="PLATFORM_ARTIFACT_STORAGE_ACCESS_KEY_ID")
     artifact_storage_secret_access_key: str = Field("", alias="PLATFORM_ARTIFACT_STORAGE_SECRET_ACCESS_KEY")
-    artifact_storage_sse: Literal["AES256", "aws:kms"] = Field("AES256", alias="PLATFORM_ARTIFACT_STORAGE_SSE")
+    artifact_storage_sse: Literal["AES256", "aws:kms", "provider"] = Field("AES256", alias="PLATFORM_ARTIFACT_STORAGE_SSE")
     artifact_storage_kms_key_id: str = Field("", alias="PLATFORM_ARTIFACT_STORAGE_KMS_KEY_ID")
     artifact_storage_prefix: str = Field("efata", alias="PLATFORM_ARTIFACT_STORAGE_PREFIX")
     artifact_storage_path: str = Field("./data/artifacts", alias="PLATFORM_ARTIFACT_STORAGE_PATH")
@@ -206,6 +206,9 @@ class Settings(BaseSettings):
     )
     asaas_api_key: str = Field("", alias="ASAAS_API_KEY")
     asaas_webhook_token: str = Field("", alias="ASAAS_WEBHOOK_TOKEN")
+    billing_webhook_max_body_bytes: int = Field(
+        1_048_576, alias="PLATFORM_BILLING_WEBHOOK_MAX_BODY_BYTES"
+    )
     asaas_api_base_url: str = Field(
         "https://api-sandbox.asaas.com/v3", alias="ASAAS_API_BASE_URL"
     )
@@ -493,6 +496,11 @@ class Settings(BaseSettings):
             raise ValueError("BILLING_USD_BRL_INVALID")
         if self.billing_http_timeout_seconds <= 0 or self.billing_http_timeout_seconds > 60:
             raise ValueError("BILLING_HTTP_TIMEOUT_INVALID")
+        if (
+            self.billing_webhook_max_body_bytes <= 0
+            or self.billing_webhook_max_body_bytes > 10_485_760
+        ):
+            raise ValueError("BILLING_WEBHOOK_MAX_BODY_BYTES_INVALID")
         for raw, code in (
             (self.billing_plan_catalog_json, "BILLING_PLAN_CATALOG_INVALID_JSON"),
             (self.billing_topup_catalog_json, "BILLING_TOPUP_CATALOG_INVALID_JSON"),

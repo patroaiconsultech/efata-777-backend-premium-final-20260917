@@ -31,7 +31,8 @@ def test_persisted_artifact_context_is_db_derived_and_exact(client):
         )
         assert msg is not None
         body = msg["content"]
-        assert "TRUSTED PERSISTED ARTIFACTS" in body
+        assert msg["role"] == "user"
+        assert "PERSISTED_ARTIFACT_CONTEXT" in body
         assert "artifact_id=artifact-runtime-1" in body
         assert "filename=resumo.docx" in body
         assert "/api/v2/artifacts/artifact-runtime-1/download" in body

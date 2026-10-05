@@ -52,6 +52,7 @@ app.include_router(platform_invitation_router)
 app.include_router(agent_studio_router)
 logger.info("PUBLIC_APPLICATIONS_RUNTIME_LOADED=true cors_origins=%s", _allowed_origins)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CSRF_EXEMPT_PROVIDER_WEBHOOK_PATHS = frozenset({"/api/v2/billing/webhooks/asaas"})
 
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
@@ -78,7 +79,12 @@ async def csrf_middleware(request: Request, call_next):
         )
     cookie_token = request.cookies.get("patroai_csrf")
     csrf_token = cookie_token or secrets.token_urlsafe(32)
-    if request.method.upper() not in safe_methods and settings.environment in {"staging", "production"}:
+    csrf_required = (
+        request.method.upper() not in safe_methods
+        and settings.environment in {"staging", "production"}
+        and request.url.path not in _CSRF_EXEMPT_PROVIDER_WEBHOOK_PATHS
+    )
+    if csrf_required:
         origin = request.headers.get("origin")
         if origin and origin not in _allowed_origins:
             return JSONResponse(status_code=403, content={"detail": "CSRF_ORIGIN_INVALID"})
