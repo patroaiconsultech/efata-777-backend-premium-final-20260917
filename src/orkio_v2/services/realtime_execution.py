@@ -29,6 +29,7 @@ from .team_runtime import (
     team_history,
 )
 from .realtime_segmenter import SentenceSegmenter
+from .thread_access_policy import ThreadAccessPolicyError, require_thread_access
 
 
 class RealtimeExecutionError(RuntimeError):
@@ -86,6 +87,30 @@ def _unexpected_execution_error(
     )
 
 
+def _realtime_participant(
+    db: Session,
+    *,
+    thread_id: str,
+    tenant_id: str,
+    user_id: str,
+):
+    """Resolve the canonical active participant used to scope Realtime history."""
+    try:
+        decision = require_thread_access(
+            db,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            require_write=True,
+        )
+    except ThreadAccessPolicyError as exc:
+        raise RealtimeExecutionError(
+            exc.code,
+            stage="thread_access",
+        ) from exc
+    return decision.participant
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeExecutionResult:
     message_id: str
@@ -130,11 +155,18 @@ async def execute_realtime_direct(
         raise _unexpected_execution_error(stage="persist_user", exc=exc, turn=turn) from exc
 
     try:
+        participant = _realtime_participant(
+            db,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         history = team_history(
             db,
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
+            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
@@ -272,11 +304,18 @@ async def execute_realtime_team(
         raise _unexpected_execution_error(stage="persist_user", exc=exc, turn=turn) from exc
 
     try:
+        participant = _realtime_participant(
+            db,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         base_history = team_history(
             db,
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
+            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
@@ -416,11 +455,18 @@ async def stream_realtime_direct(
             channel=RuntimeChannel.REALTIME,
         )
         persist_user_message(db, turn=turn, content=transcript)
+        participant = _realtime_participant(
+            db,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         history = team_history(
             db,
             thread_id=thread_id,
             tenant_id=tenant_id,
             settings=settings,
+            participant=participant,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
