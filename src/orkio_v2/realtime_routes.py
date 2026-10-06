@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -223,6 +224,58 @@ def _log_realtime_call_failure(
                 "error_code": error_code,
                 "exception_type": exception_type,
                 "validation_scope": validation_scope,
+                "release_sha": settings.release_sha,
+                "environment": settings.environment,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def _log_realtime_stream_failure(
+    *,
+    settings: Settings,
+    diagnostic_request_id: str,
+    principal: Principal,
+    thread_id: str,
+    session_id: str,
+    target_mode: str,
+    stage: str,
+    exception: Exception,
+    segments_count: int,
+    segment_id: str | None = None,
+    turn_id: str | None = None,
+    execution_id: str | None = None,
+) -> None:
+    frames = []
+    for frame in traceback.extract_tb(exception.__traceback__)[-6:]:
+        frames.append({
+            "file": frame.filename.replace("\\", "/").rsplit("/", 1)[-1][:120],
+            "line": int(frame.lineno),
+            "function": str(frame.name)[:120],
+        })
+    realtime_logger.error(
+        "REALTIME_STREAM_FAILURE %s",
+        json.dumps(
+            {
+                "diagnostic_request_id": diagnostic_request_id,
+                "execution_id": execution_id,
+                "tenant_id": principal.tenant_id,
+                "user_id": principal.user_id,
+                "thread_id": thread_id,
+                "session_id": session_id,
+                "target_mode": target_mode,
+                "pipeline": "realtime_segment_stream",
+                "stage": stage,
+                "status": "failed",
+                "error_code": "REALTIME_STREAM_FAILED",
+                "exception_type": type(exception).__name__,
+                "cause_type": type(exception.__cause__).__name__ if exception.__cause__ else None,
+                "context_type": type(exception.__context__).__name__ if exception.__context__ else None,
+                "segments_count": segments_count,
+                "segment_id": segment_id,
+                "turn_id": turn_id,
+                "trace_frames": frames,
                 "release_sha": settings.release_sha,
                 "environment": settings.environment,
             },
@@ -643,9 +696,15 @@ async def realtime_stream_turn(
         session_id=payload.session_id,
     )
 
+    stream_diagnostic_request_id = str(uuid.uuid4())
+
     async def events():
         emitted_done = False
         segments_count = 0
+        current_stage = "execution_stream"
+        current_segment_id: str | None = None
+        current_turn_id: str | None = payload.session_id
+        current_execution_id: str | None = None
         try:
             async for item in stream_realtime_direct(
                 db,
@@ -657,8 +716,16 @@ async def realtime_stream_turn(
                 transcript=payload.transcript,
                 is_admin=is_allowlisted_admin(p, settings),
             ):
+                current_stage = "dispatch_item"
                 item_type = str(item.get("type") or "")
+                item_turn_id = str(item.get("turn_id") or "").strip()
+                item_execution_id = str(item.get("execution_id") or "").strip()
+                if item_turn_id:
+                    current_turn_id = item_turn_id
+                if item_execution_id:
+                    current_execution_id = item_execution_id
                 if item_type == "segment_ready":
+                    current_stage = "segment_validation"
                     segments_count += 1
                     if segments_count > _REALTIME_STREAM_MAX_SEGMENTS:
                         raise RealtimeExecutionError(
@@ -666,9 +733,12 @@ async def realtime_stream_turn(
                             stage="tts_segment_limit",
                         )
                     segment_id = str(item.get("segment_id") or f"seg-{segments_count}")
+                    current_segment_id = segment_id
                     text_value = str(item.get("text") or "").strip()
                     if not text_value:
+                        current_stage = "execution_stream"
                         continue
+                    current_stage = "emit_segment_started"
                     yield _sse_payload({
                         "type": "segment_started",
                         "turn_id": item.get("turn_id"),
@@ -676,6 +746,7 @@ async def realtime_stream_turn(
                         "segment_number": segments_count,
                         "text": text_value,
                     })
+                    current_stage = "segment_limits"
                     _enforce_realtime_segment_limits(
                         db,
                         settings=settings,
@@ -684,6 +755,7 @@ async def realtime_stream_turn(
                         turn_id=str(item.get("turn_id") or payload.session_id),
                         segment_id=segment_id,
                     )
+                    current_stage = "tts_synthesis"
                     try:
                         audio = await synthesize_speech(
                             settings,
@@ -693,6 +765,7 @@ async def realtime_stream_turn(
                         )
                     except TextToSpeechError:
                         raise
+                    current_stage = "emit_audio_segment"
                     yield _sse_payload({
                         "type": "audio_segment",
                         "turn_id": item.get("turn_id"),
@@ -701,17 +774,24 @@ async def realtime_stream_turn(
                         "codec": "audio/mpeg",
                         "data_base64": base64.b64encode(audio).decode("ascii"),
                     })
+                    current_stage = "emit_segment_done"
                     yield _sse_payload({
                         "type": "segment_done",
                         "turn_id": item.get("turn_id"),
                         "segment_id": segment_id,
                         "segment_number": segments_count,
                     })
+                    current_stage = "execution_stream"
                 elif item_type == "text_delta":
+                    current_stage = "emit_text_delta"
                     yield _sse_payload(item)
+                    current_stage = "execution_stream"
                 elif item_type == "turn_started":
+                    current_stage = "emit_turn_started"
                     yield _sse_payload(item)
+                    current_stage = "execution_stream"
                 elif item_type == "done":
+                    current_stage = "complete_receipt"
                     receipt = complete_receipt(
                         db,
                         tenant_id=p.tenant_id,
@@ -724,7 +804,9 @@ async def realtime_stream_turn(
                     done_payload["execution_id"] = receipt.execution_id
                     done_payload["segments_count"] = segments_count
                     emitted_done = True
+                    current_stage = "emit_done"
                     yield _sse_payload(done_payload)
+                    current_stage = "completed"
         except asyncio.CancelledError:
             if not emitted_done:
                 fail_receipt(
@@ -754,8 +836,22 @@ async def realtime_stream_turn(
                     "code": code,
                     "turn_id": payload.session_id,
                 })
-        except Exception:
+        except Exception as exc:
             if not emitted_done:
+                _log_realtime_stream_failure(
+                    settings=settings,
+                    diagnostic_request_id=stream_diagnostic_request_id,
+                    principal=p,
+                    thread_id=thread_id,
+                    session_id=payload.session_id,
+                    target_mode=str(intent.get("target_mode") or "direct"),
+                    stage=current_stage,
+                    exception=exc,
+                    segments_count=segments_count,
+                    segment_id=current_segment_id,
+                    turn_id=current_turn_id,
+                    execution_id=current_execution_id,
+                )
                 fail_receipt(
                     db,
                     tenant_id=p.tenant_id,
