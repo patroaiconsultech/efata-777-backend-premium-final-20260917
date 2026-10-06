@@ -60,3 +60,5 @@ async def test_stream_realtime_direct_emits_segments_before_terminal_commit():
     assert types.count("segment_ready") == 2
     assert types[-1] == "done"
     assert emitted[-1]["message_id"] == "message-1"
+    assert emitted[-1]["execution_id"] == "turn-1"
+    assert emitted[-1]["execution_id"] == emitted[-1]["turn_id"]

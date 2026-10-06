@@ -600,6 +600,7 @@ async def stream_realtime_direct(
     yield {
         "type": "done",
         "turn_id": turn.execution_id,
+        "execution_id": turn.execution_id,
         "message_id": row.id,
         "agent_id": turn.turn_owner_agent_id,
         "agent_name": turn.display_agent_name,
