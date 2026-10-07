@@ -94,3 +94,21 @@ def test_founder_knowledge_can_be_published_and_retrieved_for_orkio_realtime(
                 message["content"] for message in other_agent.messages
             )
             assert "fundador da plataforma EFATÀ 777" not in other_joined
+
+def test_founder_import_script_is_windows_powershell_51_encoding_safe():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "import_founder_knowledge.ps1"
+    )
+    payload = script.read_bytes()
+
+    # Windows PowerShell 5.1 treats UTF-8 without BOM as the local ANSI
+    # code page. Non-ASCII punctuation can then be decoded into smart quote
+    # characters and terminate a PowerShell string unexpectedly.
+    assert all(byte < 0x80 for byte in payload)
+    text = payload.decode("ascii")
+    assert '$ProductName = "EFAT$([char]0x00C0) 777"' in text
+    assert "$EmDash = [char]0x2014" in text
+    assert '$secureToken = Read-Host "$ProductName access token" -AsSecureString' in text
+

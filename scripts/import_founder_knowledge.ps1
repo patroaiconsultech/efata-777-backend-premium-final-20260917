@@ -14,7 +14,9 @@ $ExpectedSha256 = "1a6f9ffae454ef310c0be07381dcb530a0d3e711b9df71acce8584f70aaaa
 $Scope = "INSTITUTIONAL"
 $Classification = "internal"
 $AllowedPurposes = "chat,team,realtime"
-$Title = "EFATÀ 777 — Founder Profile — Daniel Graebin"
+$ProductName = "EFAT$([char]0x00C0) 777"
+$EmDash = [char]0x2014
+$Title = "$ProductName $EmDash Founder Profile $EmDash Daniel Graebin"
 
 function Get-ResponseBody {
     param([System.Net.Http.HttpResponseMessage]$Response)
@@ -63,7 +65,7 @@ $BaseUrl = $BaseUrl.TrimEnd("/")
 
 $token = $env:EFATA777_ACCESS_TOKEN
 if ([string]::IsNullOrWhiteSpace($token)) {
-    $secureToken = Read-Host "EFATÀ 777 access token" -AsSecureString
+    $secureToken = Read-Host "$ProductName access token" -AsSecureString
     $token = [System.Net.NetworkCredential]::new("", $secureToken).Password
 }
 if ([string]::IsNullOrWhiteSpace($token)) {
