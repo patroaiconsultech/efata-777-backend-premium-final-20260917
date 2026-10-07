@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import KnowledgeDocument, KnowledgeScope, KnowledgeStatus
 from .blob_storage import BlobStorageError, build_blob_storage
+from .builtin_agent_knowledge import builtin_founder_knowledge_message
 from .document_context import DocumentContextError, extract_document_blob
 from .knowledge_repository import audit_knowledge_used
 from .large_document import LargeDocumentError, canonical_context_for_document
@@ -347,4 +348,16 @@ def knowledge_context_messages(
         agent_id=agent_id,
         query_text=query_text,
     )
-    return list(bundle.messages) if bundle else []
+    messages = list(bundle.messages) if bundle else []
+
+    builtin_founder = builtin_founder_knowledge_message(
+        db,
+        settings=settings,
+        user_id=user_id,
+        agent_id=agent_id,
+        query_text=query_text,
+    )
+    if builtin_founder:
+        messages.append(builtin_founder)
+
+    return messages
