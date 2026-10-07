@@ -253,10 +253,12 @@ def me(
     db: Session = Depends(get_db),
 ):
     profile = profile_for(db, tenant_id=p.tenant_id, user_id=p.user_id)
+    user = db.get(User, p.user_id)
     return {
         "user_id": p.user_id,
         "tenant_id": p.tenant_id,
         "email": p.email,
+        "display_name": user.display_name if user else None,
         "roles": list(p.roles),
         "admin_access": is_allowlisted_admin(p, settings),
         "co_creator_name": (
@@ -1455,9 +1457,38 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
 def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
     thread_access(db,thread_id,p)
     rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==p.tenant_id).order_by(Message.created_at)).all()
+
+    human_author_ids = {
+        m.author_id
+        for m in rows
+        if m.author_type == "user" and m.author_id
+    }
+    participant_user_ids: set[str] = set()
+    if human_author_ids:
+        participant_user_ids = set(
+            db.scalars(
+                select(ThreadParticipant.user_id).where(
+                    ThreadParticipant.tenant_id == p.tenant_id,
+                    ThreadParticipant.thread_id == thread_id,
+                    ThreadParticipant.user_id.in_(human_author_ids),
+                )
+            ).all()
+        )
+    display_names: dict[str, str] = {}
+    if participant_user_ids:
+        display_names = {
+            user.id: user.display_name
+            for user in db.scalars(
+                select(User).where(User.id.in_(participant_user_ids))
+            ).all()
+        }
+
     return [{
         "id":m.id,
         "author_type":m.author_type,
+        "author_id":m.author_id if m.author_type=="user" else None,
+        "user_id":m.author_id if m.author_type=="user" else None,
+        "author_display_name":display_names.get(m.author_id) if m.author_type=="user" else None,
         "agent_id":m.author_id if m.author_type=="agent" else None,
         "agent_name":m.agent_name,
         "content":m.content,
