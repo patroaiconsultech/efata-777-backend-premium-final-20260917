@@ -97,6 +97,10 @@ from .services.python_runtime.gateway import execute_python_runtime
 from .services.external_read_tool import ExternalReadError, read_external_url
 from .services.ao01_audit_trace import emit_audit_trace
 from .services.audit_invocation_directive import looks_like_audit_directive
+from .services.audit_natural_binding import (
+    NaturalAuditBinding,
+    resolve_natural_audit_binding,
+)
 from .services.audit_invocation_rate_limit import AuditDirectiveAbuseLimiter
 from .services.audit_invocation_service import (
     AuditInvocationError,
@@ -253,12 +257,10 @@ def me(
     db: Session = Depends(get_db),
 ):
     profile = profile_for(db, tenant_id=p.tenant_id, user_id=p.user_id)
-    user = db.get(User, p.user_id)
     return {
         "user_id": p.user_id,
         "tenant_id": p.tenant_id,
         "email": p.email,
-        "display_name": user.display_name if user else None,
         "roles": list(p.roles),
         "admin_access": is_allowlisted_admin(p, settings),
         "co_creator_name": (
@@ -331,6 +333,34 @@ def admin_overview(
         "environment": settings.environment,
         "release_sha": settings.release_sha,
     }
+
+def _resolve_audit_request(
+    message: str,
+    *,
+    resolved_agent_id: str,
+) -> tuple[bool, str | None, NaturalAuditBinding | None]:
+    if looks_like_audit_directive(message):
+        return True, message, None
+    natural = resolve_natural_audit_binding(
+        message,
+        resolved_agent_id=resolved_agent_id,
+    )
+    if natural is None:
+        return False, None, None
+    return True, natural.directive_message, natural
+
+
+def _natural_audit_http_error(binding: NaturalAuditBinding) -> HTTPException:
+    code = binding.error_code or "CAPABILITY_UNAVAILABLE"
+    status = 501 if code == "CAPABILITY_UNAVAILABLE" else 400
+    detail: dict[str, object] = {
+        "code": code,
+        "audit_intent": binding.intent,
+        "evidence_status": "NOT_PROVEN",
+    }
+    if binding.required_capability_id:
+        detail["required_capability_id"] = binding.required_capability_id
+    return HTTPException(status, detail=detail)
 
 
 def _require_console_superadmin(p: Principal, settings: Settings) -> Principal:
@@ -1457,38 +1487,9 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
 def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
     thread_access(db,thread_id,p)
     rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==p.tenant_id).order_by(Message.created_at)).all()
-
-    human_author_ids = {
-        m.author_id
-        for m in rows
-        if m.author_type == "user" and m.author_id
-    }
-    participant_user_ids: set[str] = set()
-    if human_author_ids:
-        participant_user_ids = set(
-            db.scalars(
-                select(ThreadParticipant.user_id).where(
-                    ThreadParticipant.tenant_id == p.tenant_id,
-                    ThreadParticipant.thread_id == thread_id,
-                    ThreadParticipant.user_id.in_(human_author_ids),
-                )
-            ).all()
-        )
-    display_names: dict[str, str] = {}
-    if participant_user_ids:
-        display_names = {
-            user.id: user.display_name
-            for user in db.scalars(
-                select(User).where(User.id.in_(participant_user_ids))
-            ).all()
-        }
-
     return [{
         "id":m.id,
         "author_type":m.author_type,
-        "author_id":m.author_id if m.author_type=="user" else None,
-        "user_id":m.author_id if m.author_type=="user" else None,
-        "author_display_name":display_names.get(m.author_id) if m.author_type=="user" else None,
         "agent_id":m.author_id if m.author_type=="agent" else None,
         "agent_name":m.agent_name,
         "content":m.content,
@@ -1512,12 +1513,25 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
         requested_target=effective_agent,
         channel=RuntimeChannel.CHAT_JSON,
     )
-    audit_candidate = looks_like_audit_directive(payload.content)
+    audit_candidate, audit_invocation_message, natural_audit_binding = _resolve_audit_request(
+        payload.content,
+        resolved_agent_id=turn.resolved_agent_id,
+    )
     if audit_candidate:
         _audit_trace_turn(
-            "directive_received",
+            "natural_request_received" if natural_audit_binding is not None else "directive_received",
             turn=turn,
             settings=settings,
+            capability_id=(
+                natural_audit_binding.required_capability_id
+                if natural_audit_binding is not None
+                else None
+            ),
+            operation=(
+                natural_audit_binding.intent
+                if natural_audit_binding is not None
+                else None
+            ),
             status="accepted",
         )
     observer=ExecutionObserver.from_turn(turn,execution_engine=execution.execution_engine.value)
@@ -1533,9 +1547,22 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
 
     audit_outcome: AuditInvocationOutcome | None = None
     if audit_candidate:
+        if natural_audit_binding is not None and not natural_audit_binding.executable:
+            code = natural_audit_binding.error_code or "CAPABILITY_UNAVAILABLE"
+            observer.fail(code)
+            _audit_trace_turn(
+                "natural_request_unavailable",
+                turn=turn,
+                settings=settings,
+                capability_id=natural_audit_binding.required_capability_id,
+                operation=natural_audit_binding.intent,
+                status="failed",
+                error_code=code,
+            )
+            raise _natural_audit_http_error(natural_audit_binding)
         try:
             audit_outcome = _audit_invocation_service(db, settings).invoke_if_directive(
-                message=payload.content,
+                message=audit_invocation_message or payload.content,
                 turn=turn,
                 principal_roles=p.roles,
             )
@@ -1688,12 +1715,25 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
         requested_target=effective_agent,
         channel=RuntimeChannel.CHAT_SSE,
     )
-    audit_candidate = looks_like_audit_directive(payload.content)
+    audit_candidate, audit_invocation_message, natural_audit_binding = _resolve_audit_request(
+        payload.content,
+        resolved_agent_id=turn.resolved_agent_id,
+    )
     if audit_candidate:
         _audit_trace_turn(
-            "directive_received",
+            "natural_request_received" if natural_audit_binding is not None else "directive_received",
             turn=turn,
             settings=settings,
+            capability_id=(
+                natural_audit_binding.required_capability_id
+                if natural_audit_binding is not None
+                else None
+            ),
+            operation=(
+                natural_audit_binding.intent
+                if natural_audit_binding is not None
+                else None
+            ),
             status="accepted",
         )
 
@@ -1742,14 +1782,30 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
         db.add(Message(tenant_id=tenant_id,thread_id=thread_id,author_type="user",author_id=user_id,content=payload.content))
         db.commit()
         if audit_candidate:
-            try:
-                audit_outcome = _audit_invocation_service(db, settings).invoke_if_directive(
-                    message=payload.content,
-                    turn=turn,
-                    principal_roles=p.roles,
+            if natural_audit_binding is not None and not natural_audit_binding.executable:
+                code = natural_audit_binding.error_code or "CAPABILITY_UNAVAILABLE"
+                audit_error = AuditInvocationError(
+                    code,
+                    http_status=(501 if code == "CAPABILITY_UNAVAILABLE" else 400),
                 )
-            except AuditInvocationError as exc:
-                audit_error = exc
+                _audit_trace_turn(
+                    "natural_request_unavailable",
+                    turn=turn,
+                    settings=settings,
+                    capability_id=natural_audit_binding.required_capability_id,
+                    operation=natural_audit_binding.intent,
+                    status="failed",
+                    error_code=code,
+                )
+            else:
+                try:
+                    audit_outcome = _audit_invocation_service(db, settings).invoke_if_directive(
+                        message=audit_invocation_message or payload.content,
+                        turn=turn,
+                        principal_roles=p.roles,
+                    )
+                except AuditInvocationError as exc:
+                    audit_error = exc
         hyper_surface = execution.resolved_target == "orkio"
         profile = (
             profile_for(db, tenant_id=tenant_id, user_id=user_id)
