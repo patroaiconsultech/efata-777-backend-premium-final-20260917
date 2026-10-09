@@ -63,6 +63,23 @@ def _module_matches(text: str) -> list[str]:
     return matches
 
 
+def _without_explicitly_denied_trace_requests(text: str) -> str:
+    """Exclude a narrowly scoped, explicit denial of trace/log retrieval.
+
+    Keep other sentences intact: an affirmative runtime audit request still
+    routes through the governed capability and fails closed if unavailable.
+    """
+    return re.sub(
+        r"\bnao\s+(?:solicito|peco|quero|requeiro)\s+"
+        r"(?:a\s+)?(?:consulta|acesso|leitura|busca)\s+"
+        r"(?:a\s+|de\s+|aos\s+|as\s+)?"
+        r"(?:traces?|logs?|registros?)[^.!?]*?"
+        r"(?=(?:,\s*|\s+)(?:mas|porem|contudo|entretanto|todavia)\b|(?:,\s*|\s+)e\s+(?:audite|auditar|audit|inspect|inspecione|investigue|verifique)\b|[.!?]|$)",
+        " ",
+        text,
+    )
+
+
 def _runtime_trace_requested(text: str) -> bool:
     indicators = (
         "realtime",
@@ -139,7 +156,7 @@ def resolve_natural_audit_binding(
             error_code="CAPABILITY_ARGUMENTS_REQUIRED",
         )
 
-    if _runtime_trace_requested(text):
+    if _runtime_trace_requested(_without_explicitly_denied_trace_requests(text)):
         return NaturalAuditBinding(
             intent="runtime.trace.get",
             required_capability_id=AUDIT_RUNTIME_TRACE_CAPABILITY_ID,
