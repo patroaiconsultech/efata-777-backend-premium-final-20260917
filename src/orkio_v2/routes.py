@@ -1577,6 +1577,10 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
         else None
     )
     if audit_candidate:
+        logging.getLogger("orkio.self_knowledge").info(
+            "self_knowledge.github_bypassed execution_id=%s reason=governed_audit",
+            turn.execution_id,
+        )
         # Governed audit V1 is a single-capability, network=false path. Do not
         # run GitHub/Python/external-read side paths for the same directive.
         github_messages = []
@@ -1599,6 +1603,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
             settings,
             message=payload.content,
             is_admin=is_allowlisted_admin(p, settings),
+            execution_id=turn.execution_id,
         )
         capability_messages = await runtime_capability_messages(
             message=payload.content,
@@ -1813,6 +1818,10 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             else None
         )
         if audit_candidate:
+            logging.getLogger("orkio.self_knowledge").info(
+                "self_knowledge.github_bypassed execution_id=%s reason=governed_audit",
+                turn.execution_id,
+            )
             github_messages = []
             capability_messages = []
         else:
@@ -1820,6 +1829,7 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
                 settings,
                 message=payload.content,
                 is_admin=is_allowlisted_admin(p, settings),
+                execution_id=turn.execution_id,
             )
             capability_messages = await runtime_capability_messages(
                 message=payload.content,

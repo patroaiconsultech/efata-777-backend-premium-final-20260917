@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from typing import Iterable
 import httpx
 
 from ..config import Settings
+
+_self_knowledge_logger = logging.getLogger("orkio.self_knowledge")
 
 _API_VERSION = "2022-11-28"
 _CONTEXT_TREE_ENTRY_LIMIT = 400
@@ -852,12 +855,24 @@ async def github_context_messages(
     *,
     message: str,
     is_admin: bool,
+    execution_id: str = "",
 ) -> list[dict[str, str]]:
-    """Bounded read-only repository context for explicit admin audit requests."""
+    """Bounded read-only repository context for explicit admin audit requests.
+
+    Emit metadata-only diagnostic events; never log prompt, token, or file contents.
+    """
     requested = requested_repositories_from_message(settings, message)
+    _self_knowledge_logger.info(
+        "self_knowledge.github_selection execution_id=%s enabled=%s repositories=%s authorized=%s",
+        execution_id, settings.github_enabled, len(requested), is_admin,
+    )
     if not requested:
         return []
     if not is_admin:
+        _self_knowledge_logger.info(
+            "self_knowledge.github_denied execution_id=%s reason=admin_required",
+            execution_id,
+        )
         return [{
             "role": "system",
             "content": (
@@ -875,14 +890,26 @@ async def github_context_messages(
                 query_message=message,
             )
         except GitHubIntegrationError as exc:
+            _self_knowledge_logger.warning(
+                "self_knowledge.snapshot_failure execution_id=%s repository=%s error_code=%s",
+                execution_id, repository, exc.code,
+            )
             messages.append({
                 "role": "system",
                 "content": (
-                    f"GITHUB INTEGRATION FAILED for {repository}: {exc.args[0] if exc.args else exc.code}. "
+                    f"GITHUB INTEGRATION FAILED for {repository}: {exc.code}. "
                     "Do not claim that repository contents were inspected."
                 ),
             })
             continue
+        _self_knowledge_logger.info(
+            "self_knowledge.snapshot_success execution_id=%s repository=%s commit_sha=%s files_inspected=%s",
+            execution_id, snapshot.repository, snapshot.commit_sha, len(snapshot.files),
+        )
         messages.append(_github_policy_message(snapshot))
         messages.append(_github_evidence_message(snapshot))
+    _self_knowledge_logger.info(
+        "self_knowledge.context_built execution_id=%s message_count=%s",
+        execution_id, len(messages),
+    )
     return messages
