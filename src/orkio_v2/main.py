@@ -24,8 +24,10 @@ from .agent_studio_routes import router as agent_studio_router
 from .public_activation_security import PublicActivationSecurityMiddleware
 from .sse_delivery_trace import SSEDeliveryTraceMiddleware
 from .provenance import runtime_provenance_payload
+from .self_knowledge_logging import configure_self_knowledge_logging
 
 settings=get_settings()
+configure_self_knowledge_logging()
 logger = logging.getLogger("orkio.public_applications")
 app=FastAPI(title="PatroAI Platform API",docs_url="/docs" if settings.environment!="production" else None)
 
