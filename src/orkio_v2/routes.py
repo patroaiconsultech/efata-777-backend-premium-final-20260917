@@ -53,6 +53,11 @@ from .services.direct_runtime import (
     envelope_payload,
     persist_agent_response,
 )
+from .services.thread_access_policy import (
+    ThreadAccessPolicyError,
+    require_thread_access,
+    visible_messages,
+)
 from .services.conversation_history_policy import (
     DIRECT_HISTORY_POLICY_VERSION,
     project_direct_history,
@@ -1123,13 +1128,14 @@ def _effective_agent_target(requested_target: str, p: Principal) -> str:
 INVITE_ALLOWED_ROLES={ThreadRole.owner.value, ThreadRole.moderator.value}
 
 def thread_access(db: Session, thread_id: str, p: Principal) -> tuple[Thread, ThreadParticipant]:
-    thread=db.get(Thread, thread_id)
-    if not thread or thread.tenant_id != p.tenant_id: raise HTTPException(404, "THREAD_NOT_FOUND")
-    member=db.scalar(select(ThreadParticipant).where(
-        ThreadParticipant.thread_id==thread_id, ThreadParticipant.user_id==p.user_id,
-        ThreadParticipant.active.is_(True)))
-    if not member: raise HTTPException(403, "THREAD_ACCESS_DENIED")
-    return thread, member
+    try:
+        decision = require_thread_access(
+            db, thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id
+        )
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
+    return decision.thread, decision.participant
+
 
 def _history(
     db: Session,
@@ -1139,13 +1145,16 @@ def _history(
     limit: int = 40,
     extra_system_messages: list[dict[str, str]] | None = None,
     *,
+    participant: ThreadParticipant,
     user_id: str | None = None,
     execution_id: str | None = None,
     agent_id: str | None = None,
     purpose: str = "chat",
 ) -> list[dict]:
-    rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==tenant_id)
-                    .order_by(Message.created_at.desc()).limit(limit)).all()
+    rows = visible_messages(
+        db, thread_id=thread_id, tenant_id=tenant_id,
+        participant=participant, limit=limit, newest_first=True,
+    )
     ordered=list(reversed(rows))
     projection=project_direct_history(
         ordered,
@@ -1485,8 +1494,10 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
 
 @router.get("/threads/{thread_id}/messages")
 def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
-    thread_access(db,thread_id,p)
-    rows=db.scalars(select(Message).where(Message.thread_id==thread_id,Message.tenant_id==p.tenant_id).order_by(Message.created_at)).all()
+    _, member = thread_access(db, thread_id, p)
+    rows = visible_messages(
+        db, thread_id=thread_id, tenant_id=p.tenant_id, participant=member,
+    )
     return [{
         "id":m.id,
         "author_type":m.author_type,
@@ -1637,6 +1648,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
         p.tenant_id,
         settings,
         extra_system_messages=runtime_system_messages,
+        participant=member,
         user_id=p.user_id,
         execution_id=turn.execution_id,
         agent_id=turn.turn_owner_agent_id,
@@ -1897,6 +1909,7 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             tenant_id,
             settings,
             extra_system_messages=runtime_system_messages,
+            participant=member,
             user_id=user_id,
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
