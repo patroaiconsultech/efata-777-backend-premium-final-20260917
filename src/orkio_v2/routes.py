@@ -31,6 +31,7 @@ from .services.hyper_cocreator import (
     validate_access_code,
 )
 from .services import llm
+from .services.github_agent_tools import prepare_github_tool_history
 from .services.document_context import build_document_context, document_context_message
 from .services.artifact_context import artifact_context_message
 from .services.platform_knowledge import system_capability_guard_message
@@ -1549,6 +1550,9 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     observer.start()
     try:
         llm.ensure_configured(settings)
+    except (GitHubIntegrationError, asyncio.TimeoutError) as exc:
+        observer.fail("GITHUB_TOOL_FAILED")
+        raise HTTPException(503, "GITHUB_TOOL_FAILED") from exc
     except llm.LLMNotConfigured:
         observer.fail("LLM_NOT_CONFIGURED")
         raise HTTPException(503,"LLM_NOT_CONFIGURED")
@@ -1656,7 +1660,17 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     )
 
     try:
+        if settings.github_agent_tools_enabled and not audit_candidate:
+            history = await prepare_github_tool_history(
+                settings, execution.resolved_target, history,
+                tenant_id=p.tenant_id, user_id=p.user_id,
+                execution_id=turn.execution_id,
+                is_admin=is_allowlisted_admin(p, settings),
+            )
         answer=await llm.generate(settings,execution.resolved_target,history)
+    except (GitHubIntegrationError, asyncio.TimeoutError):
+        observer.fail("GITHUB_TOOL_FAILED")
+        raise HTTPException(502, "GITHUB_TOOL_FAILED")
     except llm.LLMNotConfigured:
         observer.fail("LLM_NOT_CONFIGURED")
         raise HTTPException(503,"LLM_NOT_CONFIGURED")
@@ -2003,10 +2017,23 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             **status_data,
         ))
         parts:list[str]=[]
+        tool_history = history
         try:
-            async for piece in llm.stream(settings,agent,history):
+            if settings.github_agent_tools_enabled and not audit_candidate:
+                tool_history = await prepare_github_tool_history(
+                    settings, agent, history,
+                    tenant_id=tenant_id, user_id=user_id,
+                    execution_id=turn.execution_id,
+                    is_admin=is_allowlisted_admin(p, settings),
+                )
+            async for piece in llm.stream(settings,agent,tool_history):
                 parts.append(piece)
                 yield sse_event(event(RuntimeEventType.CHUNK,text=piece))
+        except (GitHubIntegrationError, asyncio.TimeoutError):
+            observer.fail("GITHUB_TOOL_FAILED")
+            yield sse_event(event(RuntimeEventType.ERROR,code="GITHUB_TOOL_FAILED"))
+            yield sse_event(terminal(RuntimeEventType.DONE,status="failed"))
+            return
         except llm.LLMNotConfigured:
             observer.fail("LLM_NOT_CONFIGURED")
             yield sse_event(event(RuntimeEventType.ERROR,code="LLM_NOT_CONFIGURED"))

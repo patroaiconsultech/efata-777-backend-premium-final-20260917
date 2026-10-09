@@ -270,6 +270,7 @@ class Settings(BaseSettings):
     document_ingestion_max_member_bytes: int = Field(16_000_000, alias="PLATFORM_DOCUMENT_INGESTION_MAX_MEMBER_BYTES")
     document_ingestion_docx_max_xml_bytes: int = Field(2_000_000, alias="PLATFORM_DOCUMENT_INGESTION_DOCX_MAX_XML_BYTES")
 
+    github_agent_tools_enabled: bool = Field(False, alias="PLATFORM_GITHUB_AGENT_TOOLS_ENABLED")
     github_enabled: bool = Field(False, alias="PLATFORM_GITHUB_INTEGRATION_ENABLED")
     github_read_only: bool = Field(True, alias="PLATFORM_GITHUB_READ_ONLY")
     github_allowed_repositories: str = Field("", alias="PLATFORM_GITHUB_ALLOWED_REPOSITORIES")
