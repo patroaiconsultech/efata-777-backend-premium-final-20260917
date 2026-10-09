@@ -75,3 +75,31 @@ def test_mixed_same_sentence_after_e_verifique_preserves_positive_intent():
     binding = resolve_natural_audit_binding(message, resolved_agent_id="auditor")
     assert binding is not None
     assert binding.error_code == "CAPABILITY_UNAVAILABLE"
+
+
+def test_r4_runtime_real_prompt_documental():
+    message = (
+        "AUDITOR — TESTE PRÁTICO R3-01. "
+        "Faça uma auditoria exclusivamente documental do planejamento do Sistema de Gestão de Projetos. "
+        "Verifique se recebeu contexto compartilhado e identifique riscos. "
+        "Não estou solicitando consulta a logs, traces ou execução de operações de runtime. "
+        "Apresente seu parecer documental normalmente."
+    )
+    assert resolve_natural_audit_binding(message, resolved_agent_id="auditor") is None
+
+
+def test_r4_progressive_mixed_with_estou_solicitando():
+    message = "Nao estou solicitando consulta a logs, mas audite a execucao de runtime."
+    binding = resolve_natural_audit_binding(message, resolved_agent_id="auditor")
+    assert binding is not None and binding.error_code == "CAPABILITY_UNAVAILABLE"
+
+
+def test_r4_progressive_mixed_e_audite():
+    message = "Nao estou solicitando consulta a logs e audite a execucao de runtime."
+    binding = resolve_natural_audit_binding(message, resolved_agent_id="auditor")
+    assert binding is not None and binding.error_code == "CAPABILITY_UNAVAILABLE"
+
+
+def test_r4_progressive_denial_list_e_traces():
+    message = "Verifique o planejamento. Nao estou solicitando consulta a logs e traces de runtime."
+    assert resolve_natural_audit_binding(message, resolved_agent_id="auditor") is None

@@ -70,7 +70,7 @@ def _without_explicitly_denied_trace_requests(text: str) -> str:
     routes through the governed capability and fails closed if unavailable.
     """
     return re.sub(
-        r"\bnao\s+(?:solicito|peco|quero|requeiro)\s+"
+        r"\bnao\s+(?:solicito|peco|quero|requeiro|estou\s+(?:solicitando|pedindo|requerendo))\s+"
         r"(?:a\s+)?(?:consulta|acesso|leitura|busca)\s+"
         r"(?:a\s+|de\s+|aos\s+|as\s+)?"
         r"(?:traces?|logs?|registros?)[^.!?]*?"
