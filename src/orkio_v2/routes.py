@@ -263,10 +263,12 @@ def me(
     db: Session = Depends(get_db),
 ):
     profile = profile_for(db, tenant_id=p.tenant_id, user_id=p.user_id)
+    current_user = db.get(User, p.user_id)
     return {
         "user_id": p.user_id,
         "tenant_id": p.tenant_id,
         "email": p.email,
+        "display_name": current_user.display_name if current_user else None,
         "roles": list(p.roles),
         "admin_access": is_allowlisted_admin(p, settings),
         "co_creator_name": (
@@ -1495,13 +1497,34 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
 
 @router.get("/threads/{thread_id}/messages")
 def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
+    # Canonical access governs the history scope; never infer display names
+    # across tenants or threads, even if a global user ID is present.
     _, member = thread_access(db, thread_id, p)
     rows = visible_messages(
         db, thread_id=thread_id, tenant_id=p.tenant_id, participant=member,
     )
+    human_author_ids = {
+        m.author_id for m in rows if m.author_type == "user" and m.author_id
+    }
+    human_names = {}
+    if human_author_ids:
+        human_names = dict(
+            db.execute(
+                select(User.id, User.display_name)
+                .join(ThreadParticipant, ThreadParticipant.user_id == User.id)
+                .where(
+                    ThreadParticipant.tenant_id == p.tenant_id,
+                    ThreadParticipant.thread_id == thread_id,
+                    ThreadParticipant.user_id.in_(human_author_ids),
+                )
+            ).all()
+        )
     return [{
         "id":m.id,
         "author_type":m.author_type,
+        "author_id":m.author_id if m.author_type == "user" and m.author_id in human_names else None,
+        "user_id":m.author_id if m.author_type == "user" and m.author_id in human_names else None,
+        "author_display_name":human_names.get(m.author_id) if m.author_type == "user" else None,
         "agent_id":m.author_id if m.author_type=="agent" else None,
         "agent_name":m.agent_name,
         "content":m.content,

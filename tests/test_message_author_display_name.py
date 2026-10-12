@@ -74,3 +74,48 @@ def test_thread_history_exposes_human_display_names_scoped_to_participants(clien
     assert guest["author_id"] == "user-2"
     assert guest["user_id"] == "user-2"
     assert guest["author_display_name"] == "Guest"
+
+
+def test_history_does_not_disclose_unscoped_user_name_or_id(client):
+    thread = client.post(
+        "/api/v2/threads",
+        json={"title": "Histórico com identidade não vinculada"},
+        headers=headers(),
+    )
+    assert thread.status_code == 200, thread.text
+    thread_id = thread.json()["id"]
+
+    from orkio_v2.models import User
+
+    with Testing() as db:
+        if db.get(User, "user-unscoped") is None:
+            db.add(
+                User(
+                    id="user-unscoped",
+                    external_subject="sub-unscoped",
+                    email="unscoped@example.com",
+                    display_name="Private Outside User",
+                )
+            )
+        db.add(
+            Message(
+                tenant_id="tenant-1",
+                thread_id=thread_id,
+                author_type="user",
+                author_id="user-unscoped",
+                content="unscoped-author-marker",
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        f"/api/v2/threads/{thread_id}/messages", headers=headers()
+    )
+    assert response.status_code == 200, response.text
+    item = next(
+        row for row in response.json()
+        if row["content"] == "unscoped-author-marker"
+    )
+    assert item["author_display_name"] is None
+    assert item["author_id"] is None
+    assert item["user_id"] is None
