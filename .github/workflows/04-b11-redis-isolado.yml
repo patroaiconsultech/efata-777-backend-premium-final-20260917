@@ -1,0 +1,160 @@
+name: B1.1 Redis A01 - homologacao isolada (sem deploy)
+
+on:
+  push:
+    branches:
+      - homologacao/b11-redis-isolado
+
+permissions:
+  contents: read
+
+jobs:
+  b11-redis-isolado:
+    if: github.ref == 'refs/heads/homologacao/b11-redis-isolado'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      PUBLIC_SALES_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      PUBLIC_SALES_TEST_CONFIRM_ISOLATED_REDIS: 'YES'
+      PYTHONPATH: src
+
+    steps:
+      - name: Checkout do candidato na branch isolada
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Preflight - diagnosticar 6 arquivos e escrever resumo
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import os
+
+          expected = {
+            "scripts/qualify_public_sales_b11_redis.py": "b56d49cd909e85f53489fdeb96b5b8805431570b3a820211855e3ef724edb9c9",
+            "src/orkio_v2/public_sales_redis.py": "2cc8f1897dce2c7a802d97f5b6d578539aecba7bba147c4fc066fa3a86bf34d6",
+            "src/orkio_v2/public_sales_routes.py": "59c7c063c086e679b24ab2d6a08ee336fd53046b77c40a25e7181e2ba4518908",
+            "src/orkio_v2/public_sales_security.py": "77cdc622a713a6461cad6515225e31ca1687835ce1edacbad61d1d22151460dc",
+            "tests/test_public_sales_redis_candidate.py": "e279ede5725964c753a8a9ad6bea7314fa81c257532f087b569226962c8f79d4",
+            "tests/test_public_sales_redis_live.py": "c2ea45d727b803238440decdddc26dab791cddd2169756bb24169092e88bb538",
+          }
+
+          lines = [
+            "## Gate R - Preflight Redis A01",
+            "",
+            f"- Branch: `{os.environ.get('GITHUB_REF_NAME', 'unknown')}`",
+            f"- SHA GitHub: `{os.environ.get('GITHUB_SHA', 'unknown')}`",
+            "",
+            "| Arquivo | Estado |",
+            "| --- | --- |",
+          ]
+          problems = []
+          for filename, expected_hash in expected.items():
+              source = Path(filename)
+              if not source.is_file():
+                  status = "MISSING"
+                  problems.append(filename + " (missing)")
+              else:
+                  actual = hashlib.sha256(source.read_bytes()).hexdigest()
+                  status = "OK" if actual == expected_hash else "SHA256_MISMATCH"
+                  if status != "OK":
+                      problems.append(filename + " (sha256 mismatch)")
+              lines.append(f"| `{filename}` | **{status}** |")
+              print(f"{status}: {filename}", flush=True)
+          lines += [
+            "",
+            "**Preflight:** " + ("INCOMPATIVEL: nao rodar testes ate reconciliar arquivos" if problems else "6/6 arquivos correspondem ao candidato auditado"),
+            "",
+          ]
+          summary = "\n".join(lines)
+          Path("backend-b11-preflight.txt").write_text(summary + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fd:
+              fd.write(summary + "\n")
+          if problems:
+              print("::warning title=Preflight B1.1::Arquivos ausentes ou com hashes divergentes; detalhes no Summary.", flush=True)
+          PY
+
+      - name: Conferir os 6 arquivos exatos auditados
+        id: integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c <<'SHA256'
+          b56d49cd909e85f53489fdeb96b5b8805431570b3a820211855e3ef724edb9c9  scripts/qualify_public_sales_b11_redis.py
+          2cc8f1897dce2c7a802d97f5b6d578539aecba7bba147c4fc066fa3a86bf34d6  src/orkio_v2/public_sales_redis.py
+          59c7c063c086e679b24ab2d6a08ee336fd53046b77c40a25e7181e2ba4518908  src/orkio_v2/public_sales_routes.py
+          77cdc622a713a6461cad6515225e31ca1687835ce1edacbad61d1d22151460dc  src/orkio_v2/public_sales_security.py
+          e279ede5725964c753a8a9ad6bea7314fa81c257532f087b569226962c8f79d4  tests/test_public_sales_redis_candidate.py
+          c2ea45d727b803238440decdddc26dab791cddd2169756bb24169092e88bb538  tests/test_public_sales_redis_live.py
+          SHA256
+
+      - name: Instalar dependencias de teste do backend
+        id: deps
+        run: python -m pip install -e '.[test]'
+
+      - name: Regressao dirigida B1.1 sem Redis publico
+        id: targeted
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_public_sales_redis_candidate.py -rs 2>&1 | tee backend-b11-candidate.log
+
+      - name: Executar 4 testes com Redis real exclusivo
+        id: redis_live
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_public_sales_redis_live.py -rs 2>&1 | tee backend-b11-redis-real.log
+
+      - name: Duas instancias HTTP locais usando mesmo Redis
+        id: two_instances
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/qualify_public_sales_b11_redis.py 2>&1 | tee backend-b11-duas-instancias.log
+
+      - name: Resumo final - identificar etapa que bloqueou a homologacao
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Gate R - Resultado das etapas"
+            echo ""
+            echo "| Etapa | Resultado |"
+            echo "| --- | --- |"
+            echo "| Integridade dos 6 arquivos | ${{ steps.integrity.outcome }} |"
+            echo "| Dependencias Python | ${{ steps.deps.outcome }} |"
+            echo "| Testes direcionados | ${{ steps.targeted.outcome }} |"
+            echo "| Redis real | ${{ steps.redis_live.outcome }} |"
+            echo "| Duas instancias | ${{ steps.two_instances.outcome }} |"
+            echo ""
+            echo "Resultados **skipped** nao sao PASS. Homologacao so e PASS com todas as etapas success."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Arquivar logs para AO-01
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: efata777-gate-r-redis-isolado
+          path: |
+            backend-b11-preflight.txt
+            backend-b11-candidate.log
+            backend-b11-redis-real.log
+            backend-b11-duas-instancias.log
+          if-no-files-found: warn
+          retention-days: 7
