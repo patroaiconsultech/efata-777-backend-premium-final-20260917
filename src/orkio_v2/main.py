@@ -17,6 +17,8 @@ from .realtime_routes import router as realtime_router
 from .voice_routes import router as voice_router
 from .tts_routes import router as tts_router
 from .public_applications import router as public_applications_router
+from .public_sales_routes import router as public_sales_router
+from .public_sales_security import PublicSalesSecurityMiddleware, is_public_sales_path
 from .knowledge_routes import router as knowledge_router
 from .billing.routes import router as billing_router
 from .platform_invitation_routes import router as platform_invitation_router
@@ -33,6 +35,7 @@ app=FastAPI(title="PatroAI Platform API",docs_url="/docs" if settings.environmen
 
 _allowed_origins = [x.strip() for x in settings.allowed_origins.split(",") if x.strip()]
 app.add_middleware(PublicActivationSecurityMiddleware)
+app.add_middleware(PublicSalesSecurityMiddleware)
 app.include_router(auth_router)
 app.include_router(router)
 app.include_router(team_router)
@@ -40,6 +43,7 @@ app.include_router(realtime_router)
 app.include_router(voice_router)
 app.include_router(tts_router)
 app.include_router(public_applications_router)
+app.include_router(public_sales_router)
 app.include_router(knowledge_router)
 app.include_router(billing_router)
 app.include_router(platform_invitation_router)
@@ -63,6 +67,10 @@ async def request_context_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def csrf_middleware(request: Request, call_next):
+    # Public B1.1 requests have independent origin/body/rate controls and no
+    # cookies or private CSRF authority. Other routes retain the existing policy.
+    if is_public_sales_path(request.url.path):
+        return await call_next(request)
     safe_methods = {"GET", "HEAD", "OPTIONS"}
     if request.method.upper() == "OPTIONS" and request.url.path == "/api/public/applications":
         logger.info(
