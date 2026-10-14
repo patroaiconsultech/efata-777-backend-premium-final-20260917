@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import get_settings
+from .public_sales_redis import shared_store_gate_ready
 from .public_activation_security import (
     _buffer_bounded_body,
     _replay_receive,
@@ -72,8 +73,8 @@ class PublicSalesSecurityMiddleware:
         if os.getenv("PUBLIC_SALES_ENABLED", "false").lower() != "true":
             await _reject(scope, send, 503, "PUBLIC_SALES_DISABLED")
             return
-        if settings.environment not in {"development", "test"}:
-            # No distributed session store or shared limiter qualified: never process traffic.
+        if settings.environment not in {"development", "test"} and not shared_store_gate_ready():
+            # Flag + external Redis required before any public traffic reaches the route.
             await _reject(scope, send, 503, "PUBLIC_SALES_SHARED_STORE_NOT_CONFIGURED")
             return
 

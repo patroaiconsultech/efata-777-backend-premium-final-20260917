@@ -1,7 +1,8 @@
-"""B1.1 guided public-sales vertical slice: editorial-only, development/test only.
+"""B1.1 guided public sales: editorial-only, with gated distributed state.
 
-No model, private identity, persistence, CRM, or paid provider is accessed.
-Production/staging are intentionally fail closed until shared stores are qualified.
+No model, private identity, database, CRM, or paid provider is accessed.
+Public environments fail closed unless shared Redis is explicitly approved
+and reachable. This code candidate does not itself authorize public rollout.
 """
 from __future__ import annotations
 
@@ -15,6 +16,13 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+
+from .public_sales_redis import (
+    SharedStoreUnavailable,
+    create_shared_session,
+    shared_store_gate_ready,
+    transition_shared_session,
+)
 
 router = APIRouter(prefix="/api/v2/public/sales-sessions", tags=["public-sales-editorial"])
 
@@ -37,7 +45,7 @@ Intent = Literal[
 _CATALOG = {
     "understand_platform": {
         "title": "Conhecer a plataforma",
-        "question": "Qual objetivo trouxe você até a Efatá?",
+        "question": "Qual objetivo trouxe você até a EFATA?",
         "branches": {
             "explore": ("Entender possibilidades", "Você busca orientação para qual cenário?",
                         ("operations", "Operação interna", "planning", "Planejamento")),
@@ -179,7 +187,7 @@ def _enabled() -> None:
     if os.getenv("PUBLIC_SALES_ENABLED", "false").lower() != "true":
         raise HTTPException(503, detail="PUBLIC_SALES_DISABLED")
     from .config import get_settings
-    if get_settings().environment not in {"test", "development"}:
+    if get_settings().environment not in {"test", "development"} and not shared_store_gate_ready():
         raise HTTPException(503, detail="PUBLIC_SALES_SHARED_STORE_NOT_CONFIGURED")
 
 def _check_limit(key: str, *, now: float, max_hits: int, seconds: int) -> None:
@@ -250,11 +258,35 @@ def _result(intent: Intent, first: str, second: str) -> MessageResponse:
         experience=Experience(step=3), summary=summary,
     )
 
+# Approved editorial action IDs, not browser-supplied state.
+_SHARED_ACTION_CATALOG = {
+    intent: {
+        key: [branch[2][0], branch[2][2]]
+        for key, branch in catalog["branches"].items()
+    }
+    for intent, catalog in _CATALOG.items()
+}
+
 @router.post("", status_code=201, response_model=SessionCreateResponse)
-def create_session(payload: SessionCreateRequest, request: Request) -> SessionCreateResponse:
+async def create_session(payload: SessionCreateRequest, request: Request) -> SessionCreateResponse:
     _enabled()
     now = time.time()
     client_ip = getattr(request.state, "public_sales_client_ip", "unknown")
+    from .config import get_settings
+    if get_settings().environment not in {"test", "development"}:
+        try:
+            token, expires_ms = await create_shared_session(intent=payload.entry_intent, client_ip=client_ip)
+        except SharedStoreUnavailable as exc:
+            raise HTTPException(503, detail="PUBLIC_SALES_SHARED_STORE_UNAVAILABLE") from exc
+        if token == "rate_limited":
+            raise HTTPException(429, detail="PUBLIC_SALES_RATE_LIMITED", headers={"Retry-After": "60"})
+        if token == "capacity":
+            raise HTTPException(503, detail="PUBLIC_SALES_CAPACITY_REACHED")
+        return SessionCreateResponse(
+            session_id=token, expires_at=_iso(expires_ms / 1000),
+            privacy_notice_version=PRIVACY_NOTICE_VERSION,
+            editorial_version=EDITORIAL_VERSION, opening=_opening(payload.entry_intent),
+        )
     with _lock:
         _check_limit(f"create:{client_ip}", now=now, max_hits=8, seconds=600)
         for key, session in list(_sessions.items()):
@@ -274,11 +306,39 @@ def create_session(payload: SessionCreateRequest, request: Request) -> SessionCr
     )
 
 @router.post("/{session_id}/messages", response_model=MessageResponse)
-def send_message(session_id: str, payload: MessageRequest) -> MessageResponse:
+async def send_message(session_id: str, payload: MessageRequest, request: Request) -> MessageResponse:
     _enabled()
     if payload.message is not None or not payload.action_id:
         # No disguised free text / model calls in the editorial-only gate.
         raise HTTPException(422, detail="PUBLIC_SALES_ACTION_REQUIRED")
+    from .config import get_settings
+    if get_settings().environment not in {"test", "development"}:
+        client_ip = getattr(request.state, "public_sales_client_ip", "unknown")
+        try:
+            outcome, intent, first, _ = await transition_shared_session(
+                token=session_id, action_id=payload.action_id,
+                intent_hint=payload.intent_hint, client_ip=client_ip,
+                catalog=_SHARED_ACTION_CATALOG,
+            )
+        except SharedStoreUnavailable as exc:
+            raise HTTPException(503, detail="PUBLIC_SALES_SHARED_STORE_UNAVAILABLE") from exc
+        errors = {
+            "not_found": (404,"PUBLIC_SALES_SESSION_NOT_FOUND"),
+            "expired": (410,"PUBLIC_SALES_SESSION_EXPIRED"),
+            "completed": (409,"PUBLIC_SALES_ALREADY_COMPLETED"),
+            "locked": (409,"PUBLIC_SALES_INTENT_LOCKED"),
+            "invalid": (409,"PUBLIC_SALES_ACTION_INVALID"),
+            "rate_limited": (429,"PUBLIC_SALES_RATE_LIMITED"),
+        }
+        if outcome in errors:
+            status, detail = errors[outcome]
+            headers = {"Retry-After": "60"} if status == 429 else None
+            raise HTTPException(status, detail=detail, headers=headers)
+        if outcome == "followup":
+            return _followup(intent, first)
+        if outcome == "result":
+            return _result(intent, first, payload.action_id)
+        raise HTTPException(503, detail="PUBLIC_SALES_SHARED_STORE_UNAVAILABLE")
     now = time.time()
     with _lock:
         item = _current(session_id, now)
