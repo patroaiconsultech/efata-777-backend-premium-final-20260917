@@ -1,0 +1,183 @@
+name: B1.1 Gate R-02 - resiliência Redis isolada (sem deploy)
+
+on:
+  push:
+    branches:
+      - homologacao/b11-redis-isolado
+    paths:
+      - '.github/workflows/05-b11-r02-resilience.yml'
+      - 'scripts/qualify_public_sales_b11_r02.py'
+
+permissions:
+  contents: read
+
+jobs:
+  b11-r02-isolado:
+    if: github.ref == 'refs/heads/homologacao/b11-redis-isolado'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      GITHUB_ACTIONS: 'true'
+      PYTHONPATH: src
+      PUBLIC_SALES_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      PUBLIC_SALES_TEST_CONFIRM_ISOLATED_REDIS: 'YES'
+
+    steps:
+      - name: Checkout isolado
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: '3.12'
+
+      - name: Preflight - somente candidato A01 SHA6
+        id: integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c <<'SHA256' | tee r02-preflight.log
+          b56d49cd909e85f53489fdeb96b5b8805431570b3a820211855e3ef724edb9c9  scripts/qualify_public_sales_b11_redis.py
+          2cc8f1897dce2c7a802d97f5b6d578539aecba7bba147c4fc066fa3a86bf34d6  src/orkio_v2/public_sales_redis.py
+          59c7c063c086e679b24ab2d6a08ee336fd53046b77c40a25e7181e2ba4518908  src/orkio_v2/public_sales_routes.py
+          77cdc622a713a6461cad6515225e31ca1687835ce1edacbad61d1d22151460dc  src/orkio_v2/public_sales_security.py
+          e279ede5725964c753a8a9ad6bea7314fa81c257532f087b569226962c8f79d4  tests/test_public_sales_redis_candidate.py
+          c2ea45d727b803238440decdddc26dab791cddd2169756bb24169092e88bb538  tests/test_public_sales_redis_live.py
+          SHA256
+
+      - name: Pré-condição Docker Redis efêmero
+        id: redis_ephemeral
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker ps --filter "ancestor=redis:7.4-alpine" --format '{{.ID}}' > r02-redis-ids.tmp
+          test "$(wc -l < r02-redis-ids.tmp)" -eq 1
+          CID="$(head -n 1 r02-redis-ids.tmp)"
+          test -n "$CID"
+          test "$(docker inspect --format '{{.Config.Image}}' "$CID")" = "redis:7.4-alpine"
+          printf 'B11_R02_REDIS_CONTAINER=%s\n' "$CID" >> "$GITHUB_ENV"
+          rm r02-redis-ids.tmp
+          printf '%s\n' 'Only the disposable GitHub-hosted Redis service is eligible.'
+
+      - name: Dependências Python
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[test]' > r02-install.log 2>&1
+          python -m py_compile scripts/qualify_public_sales_b11_r02.py
+          python --version | tee r02-runtime.log
+          docker exec "${B11_R02_REDIS_CONTAINER}" redis-server --version >> r02-runtime.log
+          docker exec "${B11_R02_REDIS_CONTAINER}" redis-cli INFO server |
+            grep '^redis_version:' >> r02-runtime.log
+
+      - name: R-RECOVERY - janelas/expirações
+        id: recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/qualify_public_sales_b11_r02.py --scenario recovery 2>&1 | tee r02-recovery.log
+
+      - name: R-OUTAGE - duas APIs e pause/unpause efêmero
+        id: outage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/qualify_public_sales_b11_r02.py --scenario outage 2>&1 | tee r02-outage.log
+
+      - name: R-LOAD - concorrência sintética
+        id: load
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/qualify_public_sales_b11_r02.py --scenario load 2>&1 | tee r02-load.log
+
+      - name: Garantir que Redis efêmero não fique pausado
+        if: always()
+        shell: bash
+        run: |
+          CID="${B11_R02_REDIS_CONTAINER:-}"
+          if [ -n "$CID" ]; then
+            RUNNING="$(docker inspect --format '{{.State.Paused}}' "$CID" 2>/dev/null || true)"
+            if [ "$RUNNING" = "true" ]; then docker unpause "$CID"; fi
+          fi
+
+      - name: Matriz R-02 e manifesto para AO-01
+        if: always()
+        shell: bash
+        env:
+          GATE_INTEGRITY: ${{ steps.integrity.outcome }}
+          GATE_DEPS: ${{ steps.deps.outcome }}
+          GATE_RECOVERY: ${{ steps.recovery.outcome }}
+          GATE_OUTAGE: ${{ steps.outage.outcome }}
+          GATE_LOAD: ${{ steps.load.outcome }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, sys
+          out = pathlib.Path("r02-evidence")
+          out.mkdir(exist_ok=True)
+          stages = {
+              "CANDIDATE_HASHES":os.environ["GATE_INTEGRITY"],
+              "DEPENDENCIES":os.environ["GATE_DEPS"],
+              "R_RECOVERY":os.environ["GATE_RECOVERY"],
+              "R_OUTAGE":os.environ["GATE_OUTAGE"],
+              "R_LOAD":os.environ["GATE_LOAD"],
+          }
+          all_pass = all(v == "success" for v in stages.values())
+          manifest = {
+              "gate":"R-02",
+              "run_id":os.environ.get("GITHUB_RUN_ID"),
+              "branch":os.environ.get("GITHUB_REF_NAME"),
+              "sha":os.environ.get("GITHUB_SHA"),
+              "outcomes":stages,
+              "full_homologation":"PENDING_AO01" if all_pass else "INCOMPLETE",
+              "public_activation":"NO-GO",
+              "redis":"disposable_GitHub_Actions_redis_7.4_db15",
+              "production_runtime_identity":"NOT_VERIFIED",
+              "production_slo":"NOT_ESTABLISHED",
+              "test_levels":[4,8,16],
+          }
+          (out/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
+              f.write("## R-02 Redis resiliency — test only\n\n")
+              f.write(f"Branch `{manifest['branch']}` SHA `{manifest['sha']}`\n\n")
+              f.write("| Gate | Resultado |\n|---|---|\n")
+              for key,value in stages.items():f.write(f"| {key} | **{value}** |\n")
+              f.write("\n`skipped` != `success` · AO-01 must review · production NO-GO.\n")
+          paths=[pathlib.Path(p) for p in [
+              "r02-preflight.log","r02-install.log","r02-runtime.log",
+              "r02-recovery.log","r02-outage.log","r02-load.log"
+          ] if pathlib.Path(p).is_file()]
+          paths+=list(out.glob("*.json"))+list(out.glob("api-*.log"))
+          manifest_lines=[]
+          for p in sorted(set(paths)):
+              if p.name == "SHA256SUMS.txt":continue
+              manifest_lines.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.as_posix()}")
+          (out/"SHA256SUMS.txt").write_text("\n".join(manifest_lines)+"\n")
+          PY
+
+      - name: Arquivar evidências R-02 independentemente do resultado
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: efata777-gate-r02-resilience
+          path: |
+            r02-evidence/
+            r02-preflight.log
+            r02-install.log
+            r02-runtime.log
+            r02-recovery.log
+            r02-outage.log
+            r02-load.log
+          if-no-files-found: warn
+          retention-days: 14
