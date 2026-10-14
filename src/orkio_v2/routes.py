@@ -91,6 +91,9 @@ from .services.capability_plane import (
     runtime_capability_messages,
 )
 from .services.capability_policy import CapabilityPolicy, CapabilityPolicyError
+from .services.web_search import (
+    WebSearchError, explicit_search_query, execute_explicit_web_search,
+)
 from .services.team_runtime import list_team_definitions, team_definition_payload
 from .services.internal_consultation import (
     InternalConsultationError,
@@ -1552,6 +1555,12 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
         payload.content,
         resolved_agent_id=turn.resolved_agent_id,
     )
+    # WEB-01: only the current user message can request explicit web research.
+    try:
+        web_query = None if audit_candidate else explicit_search_query(payload.content)
+    except WebSearchError as exc:
+        raise HTTPException(exc.http_status, detail={"code": exc.code,
+                            "web_search": exc.metadata()}) from exc
     if audit_candidate:
         _audit_trace_turn(
             "natural_request_received" if natural_audit_binding is not None else "directive_received",
@@ -1583,6 +1592,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     user=Message(tenant_id=p.tenant_id,thread_id=thread_id,author_type="user",author_id=p.user_id,content=payload.content)
     db.add(user); db.commit()
 
+    web_result = None  # WEB-01 optional direct-chat evidence.
     audit_outcome: AuditInvocationOutcome | None = None
     if audit_candidate:
         if natural_audit_binding is not None and not natural_audit_binding.executable:
@@ -1637,23 +1647,40 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
                 status=audit_outcome.status,
             )
     else:
-        github_messages = await github_context_messages(
-            settings,
-            message=payload.content,
-            is_admin=is_allowlisted_admin(p, settings),
-            execution_id=turn.execution_id,
-        )
-        capability_messages = await runtime_capability_messages(
-            message=payload.content,
-            roles=p.roles,
-            tenant_id=p.tenant_id,
-            user_id=p.user_id,
-            thread_id=thread_id,
-            agent_id=turn.turn_owner_agent_id,
-            request_id=turn.execution_id,
-            db=db,
-        )
-        runtime_system_messages = list(github_messages) + list(capability_messages)
+        if web_query is not None:
+            # No GitHub/Python/external-read/audit/tool preparation on a WEB-01 turn.
+            # Membership and canonical thread ACL have already been checked.
+            try:
+                web_result = await execute_explicit_web_search(
+                    query=web_query, tenant_id=p.tenant_id, user_id=p.user_id,
+                    agent_id=turn.turn_owner_agent_id, thread_id=thread_id,
+                    turn_id=turn.execution_id, environment=settings.environment,
+                )
+            except WebSearchError as exc:
+                observer.fail(exc.code)
+                raise HTTPException(exc.http_status, detail={
+                    "code": exc.code, "web_search": exc.metadata(),
+                }) from exc
+            runtime_system_messages = web_result.context_messages()
+        else:
+            web_result = None
+            github_messages = await github_context_messages(
+                settings,
+                message=payload.content,
+                is_admin=is_allowlisted_admin(p, settings),
+                execution_id=turn.execution_id,
+            )
+            capability_messages = await runtime_capability_messages(
+                message=payload.content,
+                roles=p.roles,
+                tenant_id=p.tenant_id,
+                user_id=p.user_id,
+                thread_id=thread_id,
+                agent_id=turn.turn_owner_agent_id,
+                request_id=turn.execution_id,
+                db=db,
+            )
+            runtime_system_messages = list(github_messages) + list(capability_messages)
     if hyper_surface:
         runtime_system_messages.insert(
             0,
@@ -1683,7 +1710,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     )
 
     try:
-        if settings.github_agent_tools_enabled and not audit_candidate:
+        if settings.github_agent_tools_enabled and not audit_candidate and web_result is None:
             history = await prepare_github_tool_history(
                 settings, execution.resolved_target, history,
                 tenant_id=p.tenant_id, user_id=p.user_id,
@@ -1691,6 +1718,12 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
                 is_admin=is_allowlisted_admin(p, settings),
             )
         answer=await llm.generate(settings,execution.resolved_target,history)
+        if web_result is not None:
+            answer=web_result.finalize(answer)
+    except WebSearchError as exc:
+        observer.fail(exc.code)
+        raise HTTPException(exc.http_status, detail={"code": exc.code,
+                            "web_search": exc.metadata()}) from exc
     except (GitHubIntegrationError, asyncio.TimeoutError):
         observer.fail("GITHUB_TOOL_FAILED")
         raise HTTPException(502, "GITHUB_TOOL_FAILED")
@@ -1743,6 +1776,9 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     }
     if audit_outcome is not None:
         response_payload["audit"] = audit_outcome.reference()
+    if web_result is not None:
+        response_payload["web_search"] = web_result.metadata()
+        response_payload["sources"] = [source.public() for source in web_result.sources]
     return response_payload
 
 @router.post("/threads/{thread_id}/stream")
@@ -1773,6 +1809,12 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
         payload.content,
         resolved_agent_id=turn.resolved_agent_id,
     )
+    # WEB-01: only the current user message can request explicit web research.
+    try:
+        web_query = None if audit_candidate else explicit_search_query(payload.content)
+    except WebSearchError as exc:
+        raise HTTPException(exc.http_status, detail={"code": exc.code,
+                            "web_search": exc.metadata()}) from exc
     if audit_candidate:
         _audit_trace_turn(
             "natural_request_received" if natural_audit_binding is not None else "directive_received",
@@ -1874,23 +1916,27 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             github_messages = []
             capability_messages = []
         else:
-            github_messages = await github_context_messages(
-                settings,
-                message=payload.content,
-                is_admin=is_allowlisted_admin(p, settings),
-                execution_id=turn.execution_id,
-            )
-            capability_messages = await runtime_capability_messages(
-                message=payload.content,
-                roles=p.roles,
-                tenant_id=p.tenant_id,
-                user_id=p.user_id,
-                thread_id=thread_id,
-                agent_id=turn.turn_owner_agent_id,
-                request_id=turn.execution_id,
-                db=db,
-            )
-        if hyper_surface and settings.internal_agent_consultation_enabled:
+            if web_query is not None:
+                github_messages = []
+                capability_messages = []
+            else:
+                github_messages = await github_context_messages(
+                    settings,
+                    message=payload.content,
+                    is_admin=is_allowlisted_admin(p, settings),
+                    execution_id=turn.execution_id,
+                )
+                capability_messages = await runtime_capability_messages(
+                    message=payload.content,
+                    roles=p.roles,
+                    tenant_id=p.tenant_id,
+                    user_id=p.user_id,
+                    thread_id=thread_id,
+                    agent_id=turn.turn_owner_agent_id,
+                    request_id=turn.execution_id,
+                    db=db,
+                )
+        if hyper_surface and settings.internal_agent_consultation_enabled and web_query is None:
             try:
                 internal_contributions, internal_consultation_plans = (
                     await build_internal_consultation_context(
@@ -2041,17 +2087,48 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
         ))
         parts:list[str]=[]
         tool_history = history
+        web_result = None
+        if web_query is not None:
+            yield sse_event(event(RuntimeEventType.STATUS, phase="web_search", status="running"))
+            try:
+                web_result = await execute_explicit_web_search(
+                    query=web_query, tenant_id=tenant_id, user_id=user_id,
+                    agent_id=turn.turn_owner_agent_id, thread_id=thread_id,
+                    turn_id=turn.execution_id, environment=settings.environment,
+                )
+                tool_history = list(history) + web_result.context_messages()
+            except WebSearchError as exc:
+                observer.fail(exc.code)
+                yield sse_event(event(RuntimeEventType.ERROR, code=exc.code,
+                                      web_search=exc.metadata()))
+                yield sse_event(terminal(RuntimeEventType.DONE, status="failed",
+                                         web_search=exc.metadata()))
+                return
         try:
-            if settings.github_agent_tools_enabled and not audit_candidate:
+            if settings.github_agent_tools_enabled and not audit_candidate and web_result is None:
                 tool_history = await prepare_github_tool_history(
                     settings, agent, history,
                     tenant_id=tenant_id, user_id=user_id,
                     execution_id=turn.execution_id,
                     is_admin=is_allowlisted_admin(p, settings),
                 )
-            async for piece in llm.stream(settings,agent,tool_history):
-                parts.append(piece)
-                yield sse_event(event(RuntimeEventType.CHUNK,text=piece))
+            if web_result is not None:
+                # No success chunks before full provider response/citation validation.
+                answer_full = await llm.generate(settings, agent, tool_history)
+                answer_full = web_result.finalize(answer_full)
+                parts.append(answer_full)
+                yield sse_event(event(RuntimeEventType.CHUNK, text=answer_full))
+            else:
+                async for piece in llm.stream(settings,agent,tool_history):
+                    parts.append(piece)
+                    yield sse_event(event(RuntimeEventType.CHUNK,text=piece))
+        except WebSearchError as exc:
+            observer.fail(exc.code)
+            yield sse_event(event(RuntimeEventType.ERROR, code=exc.code,
+                                  web_search=exc.metadata()))
+            yield sse_event(terminal(RuntimeEventType.DONE, status="failed",
+                                     web_search=exc.metadata()))
+            return
         except (GitHubIntegrationError, asyncio.TimeoutError):
             observer.fail("GITHUB_TOOL_FAILED")
             yield sse_event(event(RuntimeEventType.ERROR,code="GITHUB_TOOL_FAILED"))
@@ -2189,6 +2266,9 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
         )
         if audit_outcome is not None:
             done_payload["audit"] = audit_outcome.reference()
+        if web_result is not None:
+            done_payload["web_search"] = web_result.metadata()
+            done_payload["sources"] = [source.public() for source in web_result.sources]
         if generated_artifact is not None:
             done_payload["artifact"]=artifact_payload(generated_artifact)
         if artifact_error_code is not None:
