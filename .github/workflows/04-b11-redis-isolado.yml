@@ -126,6 +126,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Configuracao efemera exigida pela validacao de Settings em production.
+          # GITHUB_SHA identifica esta revisao isolada, sem usar commit do Railway.
+          export PLATFORM_RELEASE_SHA="${GITHUB_SHA}"
+          # Nunca usar o segredo real de convites do Railway.
+          export PLATFORM_INVITATION_TOKEN_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
           python scripts/qualify_public_sales_b11_redis.py 2>&1 | tee backend-b11-duas-instancias.log
 
       - name: Resumo final - identificar etapa que bloqueou a homologacao
