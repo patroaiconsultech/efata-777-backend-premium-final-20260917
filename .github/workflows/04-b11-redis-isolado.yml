@@ -30,12 +30,12 @@ jobs:
 
     steps:
       - name: Checkout do candidato na branch isolada
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # SHA imutavel conforme workflows oficiais do backend
 
-      - name: Python 3.11
-        uses: actions/setup-python@v5
+      - name: Python 3.12
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38  # SHA imutavel conforme workflows oficiais do backend
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Preflight - diagnosticar 6 arquivos e escrever resumo
         shell: bash
@@ -148,7 +148,7 @@ jobs:
 
       - name: Arquivar logs para AO-01
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # SHA imutavel conforme workflows oficiais do backend
         with:
           name: efata777-gate-r-redis-isolado
           path: |
