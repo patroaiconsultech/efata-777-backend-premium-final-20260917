@@ -18,6 +18,7 @@ from .voice_routes import router as voice_router
 from .tts_routes import router as tts_router
 from .public_applications import router as public_applications_router
 from .public_sales_routes import router as public_sales_router
+from .public_sales_b12 import router as public_sales_b12_router
 from .public_sales_security import PublicSalesSecurityMiddleware, is_public_sales_path
 from .knowledge_routes import router as knowledge_router
 from .billing.routes import router as billing_router
@@ -44,6 +45,7 @@ app.include_router(voice_router)
 app.include_router(tts_router)
 app.include_router(public_applications_router)
 app.include_router(public_sales_router)
+app.include_router(public_sales_b12_router)
 app.include_router(knowledge_router)
 app.include_router(billing_router)
 app.include_router(platform_invitation_router)
