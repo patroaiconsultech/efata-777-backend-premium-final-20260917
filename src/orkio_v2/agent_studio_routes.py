@@ -156,6 +156,34 @@ def _tenant_row(db: Session, *, tenant_id: str, row_id: str) -> AgentStudioVersi
     return row
 
 
+@router.get("/llm-configuration")
+def read_llm_configuration(
+    p: Principal = Depends(require_provisioned_superadmin),
+    settings: Settings = Depends(get_settings),
+):
+    """Read-only process LLM defaults; never assert the model used by a turn.
+
+    This endpoint deliberately does not activate Agent Studio versions,
+    expose provider credentials, or authorize a tenant to modify globals.
+    """
+    _require_admin(p, settings)
+    primary = settings.llm_primary_provider
+    model_by_provider = {
+        "openai": settings.openai_model,
+        "anthropic": settings.anthropic_model,
+        "google": settings.google_model,
+    }
+    configured_model = (model_by_provider[primary] or "").strip()
+    return {
+        "primary_provider": primary,
+        "configured_model": configured_model or None,
+        "configuration_scope": "process",
+        "configuration_source": "resolved_settings",
+        "execution_model_verified": False,
+        "admin_editable": False,
+    }
+
+
 @router.get("")
 def list_agent_studio_versions(
     p: Principal = Depends(require_provisioned_superadmin),
