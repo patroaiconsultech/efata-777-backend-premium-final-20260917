@@ -102,8 +102,19 @@ def _runtime_trace_requested(text: str) -> bool:
     return any(indicator in padded for indicator in indicators)
 
 
+# A broad audit instruction may mention hashes only as deliverables.
+# Bind a governed runtime-file operation only if the action directly targets
+# its hash. An explicit hash request without a module still fails closed.
+_RUNTIME_HASH_TARGET_RE = re.compile(
+    r"\b(?:audite|auditar|audit|inspect|inspecione|investigue|verifique)\b"
+    r"(?:\s+(?:o|a|os|as|do|da|dos|das|de|em|no|na|nos|nas|"
+    r"valor|arquivo|file|modulo|module|runtime)){0,6}"
+    r"\s+(?:sha-?256|checksum|hash)\b"
+)
+
+
 def _runtime_hash_requested(text: str) -> bool:
-    return any(token in text for token in ("sha-256", "sha256", "checksum", " hash "))
+    return _RUNTIME_HASH_TARGET_RE.search(text) is not None
 
 
 def resolve_natural_audit_binding(

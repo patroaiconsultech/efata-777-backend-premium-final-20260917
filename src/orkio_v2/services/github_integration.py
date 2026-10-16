@@ -163,6 +163,9 @@ class RepositorySnapshot:
     tree_paths: tuple[str, ...]
     files: tuple[RepositoryFile, ...]
     truncated_tree: bool
+    # Number of full candidate source files excluded by the credential guard.
+    # Contents and credential matches must never appear in model context or logs.
+    files_rejected_secret: int = 0
 
     @property
     def context_tree_entries_provided(self) -> int:
@@ -184,6 +187,7 @@ class RepositorySnapshot:
             "context_tree_entries_provided": self.context_tree_entries_provided,
             "context_tree_truncated": self.context_tree_truncated,
             "files_inspected": len(self.files),
+            "files_rejected_secret": self.files_rejected_secret,
             "files": [
                 {
                     "path": item.path,
@@ -639,14 +643,22 @@ async def repository_snapshot(
     selected = selected[: settings.github_snapshot_max_files]
 
     files: list[RepositoryFile] = []
+    files_rejected_secret = 0
     total_chars = 0
     for path in selected:
-        item = await repository_file(
-            settings,
-            head.repository,
-            commit_sha=head.commit_sha,
-            path=path,
-        )
+        # Reject the ENTIRE offending file, never redact individual matches.
+        # Do not discard other independently sanitized files in this bounded
+        # snapshot. All non-credential errors retain their fail-closed behavior.
+        try:
+            item = await repository_file(
+                settings,
+                head.repository,
+                commit_sha=head.commit_sha,
+                path=path,
+            )
+        except GitHubSecretContentRejected:
+            files_rejected_secret += 1
+            continue
         remaining = settings.github_snapshot_max_chars - total_chars
         if remaining <= 0:
             break
@@ -680,6 +692,7 @@ async def repository_snapshot(
         tree_paths=tree_paths,
         files=tuple(files),
         truncated_tree=truncated,
+        files_rejected_secret=files_rejected_secret,
     )
 
 
@@ -688,6 +701,23 @@ _REPO_ANALYSIS_RE = re.compile(
     r"reposit[oó]rio|repositorio|repo|c[oó]digo(?:[- ]fonte)?|source code|github)\b",
     re.IGNORECASE,
 )
+
+# Explicit self-reference to the platform's own code (e.g. a user addressing
+# an agent without spelling "EFATÀ" or "GitHub"). An admin may inspect only
+# server-allowlisted repositories; this regex never authorizes inspection.
+_EXPLICIT_SELF_CODE_RE = re.compile(
+    r"\b(?:autoconhecimento|self[ -]knowledge|"
+    r"(?:seu|teu|proprio|nosso)\s+(?:proprio\s+)?(?:codigo|repositorio)|"
+    r"codigo\s+(?:de\s+voces|dos\s+agentes))\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_self_code_requested(message: str) -> bool:
+    normalized = unicodedata.normalize("NFKD", message or "")
+    ascii_value = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return _EXPLICIT_SELF_CODE_RE.search(ascii_value.casefold()) is not None
+
 
 _PLATFORM_SELF_KNOWLEDGE_CONCEPTS = frozenset({
     "thread",
@@ -754,6 +784,7 @@ def requested_repositories_from_message(settings: Settings, message: str) -> tup
     if not (
         _REPO_ANALYSIS_RE.search(message or "")
         or _platform_self_knowledge_requested(message)
+        or _explicit_self_code_requested(message)
     ):
         return ()
     allowed = allowed_repositories(settings)
@@ -767,6 +798,10 @@ def requested_repositories_from_message(settings: Settings, message: str) -> tup
         selected.extend(repo for repo in allowed if "backend" in repo.casefold())
     if "frontend" in low:
         selected.extend(repo for repo in allowed if "frontend" in repo.casefold())
+    if _explicit_self_code_requested(message):
+        # Natural self-code requests without the product name still refer to
+        # this service; authorization and the server allowlist remain mandatory.
+        selected.extend(allowed)
     if re.search(r"\befat[aà]\b", low):
         # A platform self-analysis request is explicit enough to inspect the
         # server-configured allowlist, while remaining bounded/read-only.
@@ -830,6 +865,8 @@ def _github_evidence_message(snapshot: RepositorySnapshot) -> dict[str, str]:
         f"tree_entries_provided={snapshot.context_tree_entries_provided}",
         f"tree_context_truncated={str(snapshot.context_tree_truncated).lower()}",
         f"files_inspected={len(snapshot.files)}",
+        f"files_rejected_secret={snapshot.files_rejected_secret}",
+        "Rejected candidate files are NOT inspected and their contents are NOT evidence.",
         "Repository tree visible to this turn (bounded):",
         "\n".join(snapshot.tree_paths[:_CONTEXT_TREE_ENTRY_LIMIT]),
     ]
@@ -903,8 +940,9 @@ async def github_context_messages(
             })
             continue
         _self_knowledge_logger.info(
-            "self_knowledge.snapshot_success execution_id=%s repository=%s commit_sha=%s files_inspected=%s",
-            execution_id, snapshot.repository, snapshot.commit_sha, len(snapshot.files),
+            "self_knowledge.snapshot_success execution_id=%s repository=%s commit_sha=%s files_inspected=%s files_rejected_secret=%s",
+            execution_id, snapshot.repository, snapshot.commit_sha,
+            len(snapshot.files), snapshot.files_rejected_secret,
         )
         messages.append(_github_policy_message(snapshot))
         messages.append(_github_evidence_message(snapshot))
