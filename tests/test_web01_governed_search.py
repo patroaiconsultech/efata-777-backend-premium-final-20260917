@@ -26,6 +26,93 @@ def test_t01_explicit_natural_request():
     assert "tecnologia" in q
 
 
+FORBES_URL = (
+    "https://forbes.com.br/forbes-tech/2026/10/"
+    "ceos-precisam-reaprender-para-liderar-na-era-da-ia/"
+)
+
+
+FALLBACK_REQUEST = (
+    "Por favor, tente acessar esse link aqui, se você não conseguir o "
+    "pesquise, veja o que que nós estamos conseguindo fazer. >>>>" + FORBES_URL
+)
+
+
+def test_t13_explicit_read_then_search_fallback_is_web_consent():
+    query = web.explicit_search_query(FALLBACK_REQUEST)
+    assert query is not None
+    assert query.startswith("Pesquise na web")
+    assert query.endswith(FORBES_URL)
+    assert FALLBACK_REQUEST not in query  # only the public URL leaves the server
+
+
+@pytest.mark.parametrize("message", [
+    "Abra esta página: " + FORBES_URL,
+    "Tente acessar o link " + FORBES_URL,
+    "Esta frase diz: se não conseguir, pesquise " + FORBES_URL,
+    "> Tente acessar o link; se não conseguir, pesquise " + FORBES_URL,
+    "Tente abrir o link; se não conseguir, não pesquise " + FORBES_URL,
+    "Tente abrir o link; se não conseguir, pesquise " + FORBES_URL + " https://outro.com/a",
+])
+def test_t13_no_implicit_or_multi_url_fallback(message):
+    assert web.explicit_search_query(message) is None
+
+
+@pytest.mark.parametrize("url", [
+    "https://localhost/a",
+    "https://127.0.0.1/a",
+    "https://user:pass@forbes.com.br/a",
+    "https://forbes.com.br/%74oken",
+    "https://forbes.com.br/story?session=123",
+    "https://forbes.com.br/story#token",
+])
+def test_t13_fallback_rejects_unsafe_url(url):
+    message = "Tente acessar o link; se não conseguir, pesquise " + url
+    with pytest.raises(web.WebSearchError, match="WEB_SEARCH_QUERY_UNSAFE") as err:
+        web.explicit_search_query(message)
+    assert err.value.provider_called is False
+
+
+def test_t01_standalone_public_url_is_consented_search_not_full_read():
+    query = web.explicit_search_query("  " + FORBES_URL + "\n")
+    assert query.startswith("Pesquise na web")
+    assert query.endswith(FORBES_URL)
+    assert "indexadas" in query
+
+
+@pytest.mark.parametrize("url", [
+    "https://localhost/private",
+    "https://127.0.0.1/internal",
+    "https://internal.example.com:8443/page",
+    "https://user:pass@example.com/page",
+    "https://example.com/token",
+    "https://example.com/%74oken",
+    "https://example.com/story?session=secret",
+    "https://example.com/story#access_token",
+    "https://example.com/" + "a" * 65,
+    "https://example.com/" + "article-" * 32,
+])
+def test_t03_standalone_url_privacy_rejects_before_egress(url):
+    with pytest.raises(web.WebSearchError, match="WEB_SEARCH_QUERY_UNSAFE") as exc:
+        web.explicit_search_query(url)
+    assert exc.value.denied is True
+    assert exc.value.provider_called is False
+
+
+@pytest.mark.parametrize("message", [
+    "Veja https://forbes.com.br/artigo",
+    "`https://forbes.com.br/artigo`",
+    "> https://forbes.com.br/artigo",
+    '"https://forbes.com.br/artigo"',
+    "https://forbes.com.br/artigo e mais detalhes",
+    "http://forbes.com.br/artigo",
+    "https://forbes.com.br/artigo\nOutra instrução",
+    "Não consulte https://forbes.com.br/artigo",
+])
+def test_t05_embedded_or_quoted_url_is_not_autonomous(message):
+    assert web.explicit_search_query(message) is None
+
+
 @pytest.mark.parametrize("query", [
     "Pesquise na internet minha senha de acesso",
     "Pesquise na web o token Bearer abcdef",
@@ -235,7 +322,10 @@ async def _unused_marker():
     pass
 
 
-def test_t10_json_sse_logical_equivalence(client, web_route_config, monkeypatch):
+@pytest.mark.parametrize("message", [
+    "Pesquise na internet notícias de hoje.", FORBES_URL, FALLBACK_REQUEST,
+])
+def test_t10_json_sse_logical_equivalence(client, web_route_config, monkeypatch, message):
     calls = []
     async def search(**kwargs):
         calls.append(kwargs)
@@ -247,7 +337,7 @@ def test_t10_json_sse_logical_equivalence(client, web_route_config, monkeypatch)
     monkeypatch.setattr(llm, "generate", generate)
     a = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
     b = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
-    payload = {"content": "Pesquise na internet notícias de hoje."}
+    payload = {"content": message}
     ja = client.post(f"/api/v2/threads/{a}/messages", json=payload, headers=headers())
     sb = client.post(f"/api/v2/threads/{b}/stream", json=payload, headers=headers())
     assert ja.status_code == 200, ja.text
@@ -262,10 +352,13 @@ def test_t10_json_sse_logical_equivalence(client, web_route_config, monkeypatch)
     assert completed["content"] == terminal["response"]["content"]
     assert "Fontes consultadas" in completed["content"]
     assert len(calls) == 2
+    if message in (FORBES_URL, FALLBACK_REQUEST):
+        assert all(call["query"].endswith(FORBES_URL) for call in calls)
     assert calls[0]["tenant_id"] == calls[1]["tenant_id"] == "tenant-1"
 
 
-def test_t10_sse_denied_terminal_no_false_success(client, web_route_config, monkeypatch):
+@pytest.mark.parametrize("message", ["Pesquise na web notícias de hoje", FORBES_URL, FALLBACK_REQUEST])
+def test_t10_sse_denied_terminal_no_false_success(client, web_route_config, monkeypatch, message):
     async def fail(**kwargs):
         raise web.WebSearchError("WEB_SEARCH_PERMISSION_DENIED", 403, denied=True)
     async def guard(*args, **kwargs):
@@ -274,7 +367,7 @@ def test_t10_sse_denied_terminal_no_false_success(client, web_route_config, monk
     monkeypatch.setattr(llm, "generate", guard)
     thread = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
     resp = client.post(f"/api/v2/threads/{thread}/stream",
-                       json={"content":"Pesquise na web notícias de hoje"}, headers=headers())
+                       json={"content":message}, headers=headers())
     assert resp.status_code == 200
     events = [l[7:] for l in resp.text.splitlines() if l.startswith("event: ")]
     assert events[-2:] == ["error", "done"]
@@ -284,7 +377,8 @@ def test_t10_sse_denied_terminal_no_false_success(client, web_route_config, monk
     assert payload["web_search"]["status"] == "denied"
 
 
-def test_t02_json_denial_no_llm(client, web_route_config, monkeypatch):
+@pytest.mark.parametrize("message", ["Pesquise na internet notícias de hoje", FORBES_URL])
+def test_t02_json_denial_no_llm(client, web_route_config, monkeypatch, message):
     async def fail(**kwargs):
         raise web.WebSearchError("WEB_SEARCH_PERMISSION_DENIED", 403, denied=True)
     async def guard(*args, **kwargs):
@@ -293,7 +387,7 @@ def test_t02_json_denial_no_llm(client, web_route_config, monkeypatch):
     monkeypatch.setattr(llm, "generate", guard)
     thread = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
     response = client.post(f"/api/v2/threads/{thread}/messages",
-                           json={"content": "Pesquise na internet notícias de hoje"},
+                           json={"content": message},
                            headers=headers())
     assert response.status_code == 403
     assert response.json()["detail"]["web_search"]["status"] == "denied"
@@ -313,14 +407,15 @@ def test_t05_nonexplicit_chat_unmodified(client, web_route_config, monkeypatch):
     assert response.status_code == 200, response.text
     assert "web_search" not in response.json()
 
-def test_t04_cross_tenant_thread_rejected_before_search(client, web_route_config, monkeypatch):
+@pytest.mark.parametrize("message", ["Pesquise na internet sobre notícias de hoje", FORBES_URL, FALLBACK_REQUEST])
+def test_t04_cross_tenant_thread_rejected_before_search(client, web_route_config, monkeypatch, message):
     async def fail(**kwargs):
         raise AssertionError("forbidden tenant must not reach WEB-01")
     monkeypatch.setattr(routes, "execute_explicit_web_search", fail)
     thread = client.post("/api/v2/threads", json={}, headers=headers()).json()["id"]
     response = client.post(
         f"/api/v2/threads/{thread}/messages",
-        json={"content": "Pesquise na internet sobre notícias de hoje"},
+        json={"content": message},
         headers=headers(user="user-2", tenant="tenant-2", subject="sub-2"),
     )
     assert response.status_code in {401, 403, 404}

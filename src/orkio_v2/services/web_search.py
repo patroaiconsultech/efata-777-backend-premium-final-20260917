@@ -33,6 +33,22 @@ _PREFIX = re.compile(
     re.IGNORECASE,
 )
 _WEB_WORD = re.compile(r"\b(?:internet|web|online|not[ií]cias?\s+de\s+hoje|fontes?\s+atuais)\b", re.I)
+# A standalone HTTPS URL is an explicit request to research that public link.
+# Embedded/quoted URLs never authorize outbound WEB-01 search on their own.
+_STANDALONE_HTTPS = re.compile(r"""^https://[^\s<>"'`\\\[\]{}()]+$""", re.I)
+# WEB-01: a deliberate, conditional "try reading; if unavailable, search"
+# counts as explicit SEARCH consent even with an introductory phrase.
+# This does not enable External Read or widen server-side web grants.
+_FALLBACK_READ_REQUEST = re.compile(
+    r"^\s*(?:por\s+favor[,;:\s]*)?(?:tente\s+)?(?:abra|abrir|acesse|acessar|leia|ler|analise|analisar)\b",
+    re.I,
+)
+_FALLBACK_SEARCH = re.compile(
+    r"\bse\s+(?:\w+\s+){0,6}n[aã]o\s+(?:conseguir|puder)\b"
+    r"(?:\s+\w+){0,5}[\s,;:]+(?:o\s+)?(?:pesquise|busque|procure|consulte)\b",
+    re.I,
+)
+_URL_IN_REQUEST = re.compile(r"""https://[^\s<>"'`\\[\]{}()]+""", re.I)
 _NEGATION = re.compile(r"\b(?:n[aã]o|nunca|jamais|sem)\s+(?:\w+\s+){0,3}(?:pesquise|buscar|busque|pesquisar|acessar)\b", re.I)
 _PRIVATE = re.compile(
     r"(?:\b(?:bearer|api[_ -]?key|secret|segredo|privado|confidencial|senha|password|token|cpf|cnpj|"
@@ -69,8 +85,46 @@ class WebSearchError(Exception):
 
 
 def explicit_search_query(message: str) -> str | None:
-    """Strict user-message-only consent. Quoted instructions never authorize egress."""
-    if not isinstance(message, str) or not _PREFIX.match(message):
+    """Current-message-only consent: explicit search or one standalone public URL."""
+    if not isinstance(message, str):
+        return None
+
+    url = message.strip()
+    if not _STANDALONE_HTTPS.fullmatch(url):
+        # An embedded link alone is still not consent. Restrict this exception
+        # to an explicit reading request WITH an explicit search fallback.
+        if (
+            len(message) <= 800
+            and not message.lstrip().startswith((">", '"', "'", "```"))
+            and _FALLBACK_READ_REQUEST.match(message)
+            and _FALLBACK_SEARCH.search(message)
+        ):
+            urls = _URL_IN_REQUEST.findall(message)
+            if len(urls) == 1:
+                url = urls[0].rstrip(".,;:!?")
+    if _STANDALONE_HTTPS.fullmatch(url):
+        # Do not send signed/private links or opaque URL parameters to Brave.
+        # This is a search for indexed excerpts, NOT full-page external reading.
+        if (
+            _safe_url(url) is None
+            or "%" in url  # no encoded credentials or hidden delimiters
+            or _PRIVATE.search(url)
+            or _CONTROL.search(url)
+            or any(unicodedata.category(c) == "Cf" for c in url)
+        ):
+            raise WebSearchError("WEB_SEARCH_QUERY_UNSAFE", 403, denied=True)
+        parts = urlsplit(url)
+        if (
+            parts.query or parts.fragment
+            or any(len(segment) > 64 for segment in parts.path.split("/"))
+        ):
+            raise WebSearchError("WEB_SEARCH_QUERY_UNSAFE", 403, denied=True)
+        query = f"Pesquise na web informações públicas indexadas sobre esta página: {url}"
+        if len(query) > 240 or len(query.split()) > 75:
+            raise WebSearchError("WEB_SEARCH_QUERY_UNSAFE", 403, denied=True)
+        return query
+
+    if not _PREFIX.match(message):
         return None
     if _NEGATION.search(message[:100]) or not _WEB_WORD.search(message):
         return None
