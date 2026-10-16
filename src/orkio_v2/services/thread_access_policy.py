@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
@@ -33,6 +34,28 @@ def _validate_history_policy(participant: ThreadParticipant) -> str:
     return policy
 
 
+def can_read_messages(participant: ThreadParticipant) -> bool:
+    # Legacy rows must retain existing read behavior after an additive migration.
+    return participant.can_read_messages is not False
+
+
+def can_write_messages(participant: ThreadParticipant) -> bool:
+    return (
+        participant.thread_role != ThreadRole.viewer.value
+        and participant.can_write_messages is not False
+    )
+
+
+def require_message_read(participant: ThreadParticipant) -> None:
+    if not can_read_messages(participant):
+        raise ThreadAccessPolicyError("THREAD_MESSAGE_READ_DENIED", 403)
+
+
+def require_message_write(participant: ThreadParticipant) -> None:
+    if not can_write_messages(participant):
+        raise ThreadAccessPolicyError("THREAD_READ_ONLY", 403)
+
+
 def require_thread_access(
     db: Session,
     *,
@@ -62,12 +85,26 @@ def require_thread_access(
     )
     if participant is None:
         raise ThreadAccessPolicyError("THREAD_ACCESS_DENIED", 403)
+    # Canonical boundary shared by REST, SSE, Team, Realtime and direct
+    # message retrieval. Never rely on the UI or scheduled cleanup.
+    if participant.access_expires_at is not None:
+        cutoff = participant.access_expires_at
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        if cutoff <= datetime.now(timezone.utc):
+            raise ThreadAccessPolicyError("THREAD_ACCESS_EXPIRED", 403)
 
     _validate_history_policy(participant)
-    if require_write and participant.thread_role == ThreadRole.viewer.value:
-        raise ThreadAccessPolicyError("THREAD_READ_ONLY", 403)
+    if require_write:
+        require_message_write(participant)
 
     return ThreadAccessDecision(thread=thread, participant=participant)
+
+
+def history_visible_since(participant: ThreadParticipant):
+    """Canonical lower bound for resources governed by thread history grants."""
+    policy = _validate_history_policy(participant)
+    return participant.joined_at if policy == "from_join" else None
 
 
 def _apply_history_scope(
@@ -75,9 +112,9 @@ def _apply_history_scope(
     *,
     participant: ThreadParticipant,
 ) -> Select:
-    policy = _validate_history_policy(participant)
-    if policy == "from_join":
-        stmt = stmt.where(Message.created_at >= participant.joined_at)
+    since = history_visible_since(participant)
+    if since is not None:
+        stmt = stmt.where(Message.created_at >= since)
     return stmt
 
 
@@ -92,6 +129,8 @@ def visible_messages(
 ) -> list[Message]:
     """Load only messages visible under the participant's canonical history grant."""
 
+    if not can_read_messages(participant):
+        return []
     stmt = select(Message).where(
         Message.thread_id == thread_id,
         Message.tenant_id == tenant_id,
@@ -120,6 +159,8 @@ def visible_message_by_id(
     inaccessible message exists.
     """
 
+    if not can_read_messages(participant):
+        return None
     stmt = select(Message).where(
         Message.id == message_id,
         Message.thread_id == thread_id,

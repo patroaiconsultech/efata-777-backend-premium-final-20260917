@@ -817,7 +817,7 @@ def test_migration_graph_advances_canonically_to_011():
     cfg = Config(str(root / "alembic.ini"))
     cfg.set_main_option("script_location", str(root / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["013_agent_studio_control_plane"]
+    assert script.get_heads() == ["016_thread_participant_access_expiry"]
     rev_011 = script.get_revision("011_billing_wallet")
     rev_010 = script.get_revision("010_billing_core")
     assert rev_011.down_revision == "010_billing_core"

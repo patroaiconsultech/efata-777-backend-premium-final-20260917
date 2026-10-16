@@ -33,6 +33,10 @@ async def test_stream_realtime_direct_emits_segments_before_terminal_commit():
             return_value=SimpleNamespace(history_access="full_thread", joined_at=None),
         ),
         patch.object(realtime_execution, "team_history", return_value=[]),
+        # Segmenter test is not a database ACL integration test; independently
+        # exercised in test_ao01_active_stream_guard_dg01.py.
+        patch.object(realtime_execution, "snapshot_grant", return_value=object()),
+        patch.object(realtime_execution, "require_live_stream_access"),
         patch.object(
             realtime_execution,
             "profile_for",
@@ -44,7 +48,7 @@ async def test_stream_realtime_direct_emits_segments_before_terminal_commit():
         patch.object(realtime_execution, "envelope_payload", return_value={}),
     ):
         async for item in realtime_execution.stream_realtime_direct(
-            object(),
+            SimpleNamespace(get_bind=lambda: object()),
             settings=settings,
             tenant_id="tenant-1",
             user_id="user-1",

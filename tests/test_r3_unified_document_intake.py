@@ -393,8 +393,9 @@ def test_r3_team_runtime_passes_latest_user_query_to_document_context(
 
     captured = {}
 
-    def fake_context(db, *, settings, tenant_id, thread_id, query_text=""):
+    def fake_context(db, *, settings, tenant_id, thread_id, query_text="", visible_since=None):
         captured["query_text"] = query_text
+        captured["visible_since"] = visible_since
         return None
 
     monkeypatch.setattr(team_runtime, "document_context_message", fake_context)
@@ -405,10 +406,13 @@ def test_r3_team_runtime_passes_latest_user_query_to_document_context(
             thread_id=thread_id,
             tenant_id="tenant-1",
             settings=get_settings(),
-            participant=SimpleNamespace(history_access="full_thread", joined_at=None),
+            participant=SimpleNamespace(
+                history_access="full_thread", joined_at=None, can_read_messages=None, can_view_attachments=True,
+            ),
         )
 
     assert captured["query_text"] == "Pergunta financeira de governança para o Team"
+    assert captured["visible_since"] is None
 
 
 

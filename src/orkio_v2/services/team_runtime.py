@@ -22,6 +22,8 @@ from .thread_access_policy import (
     ThreadAccessPolicyError,
     require_thread_access as require_canonical_thread_access,
     visible_messages,
+    history_visible_since,
+    can_read_messages,
 )
 
 
@@ -295,6 +297,7 @@ def team_history(
     execution_id: str | None = None,
     agent_id: str | None = None,
     purpose: str = "team",
+    current_message: str | None = None,
 ) -> list[dict]:
     rows = visible_messages(
         db,
@@ -306,17 +309,23 @@ def team_history(
     )
     ordered = list(reversed(rows))
     history = [history_item(row, current_user_id=user_id) for row in ordered]
-    latest_user_content = next(
+    if not can_read_messages(participant) and current_message is not None:
+        history.append({"role": "user", "content": current_message})
+    latest_user_content = current_message or next(
         (str(row.content or "") for row in reversed(ordered) if row.author_type == "user"),
         "",
     )
     system_guard = system_capability_guard_message(latest_user_content)
-    context = document_context_message(
-        db,
-        settings=settings,
-        tenant_id=tenant_id,
-        thread_id=thread_id,
-        query_text=latest_user_content,
+    context = (
+        document_context_message(
+            db,
+            settings=settings,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            query_text=latest_user_content,
+            visible_since=history_visible_since(participant),
+        )
+        if participant.can_view_attachments else None
     )
     system_messages: list[dict] = []
     if system_guard:

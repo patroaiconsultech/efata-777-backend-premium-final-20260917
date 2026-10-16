@@ -91,18 +91,66 @@ class MessageCreate(BaseModel):
     agent: str = Field("Josué", max_length=160)
 
 
+class HumanMessageCreate(BaseModel):
+    """Human-only turn: never accepts agent/tool/stream instructions."""
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=100000)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("THREAD_MESSAGE_EMPTY")
+        return value.strip()
+
+
 class LargePasteIntakeRequest(BaseModel):
     content: str = Field(min_length=1, max_length=5_000_000)
     title: str | None = Field(default=None, max_length=240)
 
-class InvitationCreate(BaseModel):
+class ThreadAgentGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    history_access: Literal["from_join", "full_thread"] = "from_join"
+    allowed_agent_ids: list[str] = Field(default_factory=lambda: ["orkio"], min_length=1, max_length=64)
+    can_upload_files: bool = False
+    # None retains grants on legacy update clients and historic invitation behavior.
+    can_read_messages: bool | None = None
+    can_write_messages: bool | None = None
+    can_view_attachments: bool | None = None
+    can_download_artifacts: bool | None = None
+    can_generate_artifacts: bool | None = None
+
+    @field_validator("allowed_agent_ids")
+    @classmethod
+    def validate_agent_ids(cls, values: list[str]) -> list[str]:
+        from .agents.registry import list_agents
+        valid = {item.slug for item in list_agents()}
+        if any(value not in valid for value in values) or len(set(values)) != len(values):
+            raise ValueError("THREAD_AGENT_GRANT_INVALID")
+        return values
+
+
+class InvitationCreate(ThreadAgentGrant):
     email: EmailStr
-    role: Literal["moderator","participant","viewer"] = "participant"
-    history_access: Literal["from_join","full_thread"] = "from_join"
+    # Default 72h starts on acceptance, not on sending the invitation.
+    # Explicit null represents no expiry; legacy stored NULL also remains unlimited.
+    access_duration_hours: int | None = Field(default=72, ge=1, le=8760)
+    role: Literal["moderator", "participant", "viewer"] = "participant"
     can_view_attachments: bool = False
     can_download_artifacts: bool = False
-    can_upload_files: bool = False
     can_generate_artifacts: bool = False
+
+
+class ThreadParticipantGrantUpdate(ThreadAgentGrant):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ThreadParticipantAccessUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Explicitly managed only by a thread owner. NULL removes the expiry.
+    duration_hours: int | None = Field(ge=1, le=8760)
+
 
 class InvitationOut(BaseModel):
     invitation_id: str

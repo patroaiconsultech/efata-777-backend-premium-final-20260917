@@ -234,7 +234,7 @@ def test_agent_studio_migration_is_additive_and_single_head():
 
     root = Path(__file__).resolve().parents[1]
     script = ScriptDirectory.from_config(Config(str(root / "alembic.ini")))
-    assert script.get_heads() == ["013_agent_studio_control_plane"]
+    assert script.get_heads() == ["016_thread_participant_access_expiry"]
     revision = script.get_revision("013_agent_studio_control_plane")
     assert revision is not None
     assert revision.down_revision == "012_platform_user_invitations"

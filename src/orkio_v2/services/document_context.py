@@ -7,6 +7,7 @@ import logging
 import re
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -468,6 +469,7 @@ def build_document_context(
     tenant_id: str,
     thread_id: str,
     query_text: str = "",
+    visible_since: datetime | None = None,
 ) -> DocumentContextBundle | None:
     """Build document material plus truthful provenance for a canonical turn.
 
@@ -478,13 +480,14 @@ def build_document_context(
     if not settings.document_context_enabled:
         return None
 
+    query = select(Attachment).where(
+        Attachment.tenant_id == tenant_id,
+        Attachment.thread_id == thread_id,
+    )
+    if visible_since is not None:
+        query = query.where(Attachment.created_at >= visible_since)
     rows = db.scalars(
-        select(Attachment)
-        .where(
-            Attachment.tenant_id == tenant_id,
-            Attachment.thread_id == thread_id,
-        )
-        .order_by(Attachment.created_at.asc(), Attachment.id.asc())
+        query.order_by(Attachment.created_at.asc(), Attachment.id.asc())
         .limit(settings.document_context_max_files)
     ).all()
     if not rows:
@@ -747,6 +750,7 @@ def document_context_message(
     tenant_id: str,
     thread_id: str,
     query_text: str = "",
+    visible_since: datetime | None = None,
 ) -> dict | None:
     bundle = build_document_context(
         db,
@@ -754,5 +758,6 @@ def document_context_message(
         tenant_id=tenant_id,
         thread_id=thread_id,
         query_text=query_text,
+        visible_since=visible_since,
     )
     return bundle.message if bundle is not None else None

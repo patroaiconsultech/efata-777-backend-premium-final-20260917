@@ -12,7 +12,8 @@ from ..auth import Principal
 from ..config import Settings
 from ..models import InviteStatus, Thread, ThreadInvitation, ThreadParticipant, User
 from ..schemas import InvitationCreate
-from .thread_access_policy import ThreadAccessPolicyError, require_thread_access
+from .thread_access_policy import ThreadAccessPolicyError, require_thread_access, can_read_messages, can_write_messages
+from .thread_agent_grants import require_agents_allowed
 
 
 INVITE_ALLOWED_ROLES = {"owner", "moderator"}
@@ -44,7 +45,7 @@ def _active_user_for_email(
     )
     if user is None:
         return None
-    return db.scalar(
+    participant = db.scalar(
         select(ThreadParticipant).where(
             ThreadParticipant.tenant_id == tenant_id,
             ThreadParticipant.thread_id == thread_id,
@@ -52,6 +53,10 @@ def _active_user_for_email(
             ThreadParticipant.active.is_(True),
         )
     )
+    if participant is not None and participant.access_expires_at is not None:
+        if _aware(participant.access_expires_at) <= datetime.now(timezone.utc):
+            return None
+    return participant
 
 
 def create_invitation(
@@ -73,7 +78,25 @@ def create_invitation(
         raise HTTPException(exc.status_code, exc.code) from exc
     if decision.participant.thread_role not in INVITE_ALLOWED_ROLES:
         raise HTTPException(403, "THREAD_INVITE_PERMISSION_REQUIRED")
+    if decision.participant.thread_role != "owner":
+        require_agents_allowed(decision.participant, payload.allowed_agent_ids)
+        if payload.history_access == "full_thread" and decision.participant.history_access != "full_thread":
+            raise HTTPException(403, "THREAD_HISTORY_GRANT_DENIED")
+        if payload.can_upload_files and not decision.participant.can_upload_files:
+            raise HTTPException(403, "THREAD_UPLOAD_GRANT_DENIED")
+        if payload.can_view_attachments and not decision.participant.can_view_attachments:
+            raise HTTPException(403, "THREAD_DOCUMENT_GRANT_DENIED")
+        if payload.can_download_artifacts and not decision.participant.can_download_artifacts:
+            raise HTTPException(403, "THREAD_ARTIFACT_GRANT_DENIED")
+        if payload.can_generate_artifacts and not decision.participant.can_generate_artifacts:
+            raise HTTPException(403, "THREAD_ARTIFACT_GENERATE_GRANT_DENIED")
+        if payload.can_read_messages is not False and not can_read_messages(decision.participant):
+            raise HTTPException(403, "THREAD_READ_GRANT_DENIED")
+        if payload.role != "viewer" and payload.can_write_messages is not False and not can_write_messages(decision.participant):
+            raise HTTPException(403, "THREAD_WRITE_GRANT_DENIED")
 
+    if payload.role == "viewer" and payload.can_write_messages is True:
+        raise HTTPException(422, "THREAD_VIEWER_CANNOT_WRITE")
     email = _normalized_email(str(payload.email))
     now = datetime.now(timezone.utc)
 
@@ -105,12 +128,16 @@ def create_invitation(
         token_prefix=token[:8],
         thread_role=payload.role,
         history_access=payload.history_access,
+        allowed_agent_ids=payload.allowed_agent_ids,
+        can_read_messages=payload.can_read_messages,
+        can_write_messages=payload.can_write_messages,
         can_view_attachments=payload.can_view_attachments,
         can_download_artifacts=payload.can_download_artifacts,
         can_upload_files=payload.can_upload_files,
         can_generate_artifacts=payload.can_generate_artifacts,
         created_by=principal.user_id,
         expires_at=now + timedelta(hours=settings.invitation_ttl_hours),
+        access_duration_hours=payload.access_duration_hours,
     )
     db.add(invitation)
     db.flush()
@@ -155,7 +182,10 @@ def accept_invitation(
         )
         .with_for_update()
     )
-    if existing is not None and existing.active:
+    if existing is not None and existing.active and (
+        existing.access_expires_at is None
+        or _aware(existing.access_expires_at) > now
+    ):
         raise HTTPException(409, "THREAD_PARTICIPANT_ALREADY_ACTIVE")
 
     if existing is None:
@@ -172,12 +202,19 @@ def accept_invitation(
     existing.membership_type = "external_guest"
     existing.thread_role = invitation.thread_role
     existing.history_access = invitation.history_access
+    existing.allowed_agent_ids = invitation.allowed_agent_ids
+    existing.can_read_messages = invitation.can_read_messages
+    existing.can_write_messages = invitation.can_write_messages
     existing.can_view_attachments = invitation.can_view_attachments
     existing.can_download_artifacts = invitation.can_download_artifacts
     existing.can_upload_files = invitation.can_upload_files
     existing.can_generate_artifacts = invitation.can_generate_artifacts
     existing.active = True
     existing.joined_at = now
+    existing.access_expires_at = (
+        now + timedelta(hours=invitation.access_duration_hours)
+        if invitation.access_duration_hours is not None else None
+    )
 
     invitation.status = InviteStatus.accepted.value
     invitation.accepted_at = now

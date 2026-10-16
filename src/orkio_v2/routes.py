@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import select, text, func
+from sqlalchemy import select, text, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from .auth import Principal, require_principal
@@ -11,9 +11,11 @@ from .config import Settings, get_settings
 from .database import Base, get_db, engine
 from .models import *
 from .schemas import *
-from .services.invitations import create_invitation, accept_invitation
+from .services.invitations import create_invitation, accept_invitation, revoke_participant
 from .services.identity import (
     require_provisioned_principal,
+    require_collaboration_principal,
+    require_thread_principal,
     require_provisioned_admin,
     require_provisioned_superadmin,
     require_known_principal,
@@ -54,10 +56,17 @@ from .services.direct_runtime import (
     envelope_payload,
     persist_agent_response,
 )
+from .services.thread_agent_grants import allowed_agent_ids, require_agents_allowed, principal_can_use_all_agents
+from .services.active_stream_access import guard_sse_stream, snapshot_grant, require_live_stream_access
 from .services.thread_access_policy import (
     ThreadAccessPolicyError,
     require_thread_access,
     visible_messages,
+    history_visible_since,
+    can_read_messages,
+    can_write_messages,
+    require_message_read,
+    require_message_write,
 )
 from .services.conversation_history_policy import (
     DIRECT_HISTORY_POLICY_VERSION,
@@ -261,7 +270,7 @@ def complete_hyper_cocreator_onboarding(
 
 @router.get("/me")
 def me(
-    p: Principal = Depends(require_provisioned_principal),
+    p: Principal = Depends(require_collaboration_principal),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
@@ -1076,13 +1085,21 @@ def admin_governance(
 
 @router.get("/agents")
 def agents_catalog(
-    p: Principal = Depends(require_provisioned_principal),
+    thread_id: str | None = Query(default=None),
+    p: Principal = Depends(require_collaboration_principal),
     settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ):
-    admin = bool({"admin", "orkio_admin", "owner", "superadmin", "platform_owner"}.intersection(p.roles))
+    admin = principal_can_use_all_agents(p)
     catalog = list_agents()
-    if not admin:
-        catalog = tuple(agent for agent in catalog if agent.slug.lower() == "orkio")
+    if thread_id:
+        _, member = thread_access(db, thread_id, p)
+        if not admin:
+            permitted = set(allowed_agent_ids(member))
+            catalog = tuple(agent for agent in catalog if agent.slug in permitted)
+    elif not admin:
+        # Do not disclose any per-thread grant without checking that thread's ACL.
+        catalog = tuple(agent for agent in catalog if agent.slug == "orkio")
     return [{
         "slug": a.slug,
         "canonical_name": a.canonical_name,
@@ -1124,11 +1141,12 @@ def _resolve_target_or_404(requested_target: str, settings: Settings):
         raise HTTPException(404, detail={"code": exc.code}) from exc
 
 
-def _effective_agent_target(requested_target: str, p: Principal) -> str:
-    if {"admin", "orkio_admin"}.intersection(p.roles):
+def _effective_agent_target(
+    requested_target: str, p: Principal, member: ThreadParticipant, settings: Settings
+) -> str:
+    if principal_can_use_all_agents(p) or member.allowed_agent_ids is not None:
         return requested_target
-    # O resolver mantém IDs técnicos no namespace explícito `id:<slug>`.
-    # Retornar o slug cru aqui fazia o Co-Criador cair em TARGET_NOT_FOUND.
+    # Legacy non-admins retain the prior Co-Creator-only behavior.
     return "id:orkio"
 
 INVITE_ALLOWED_ROLES={ThreadRole.owner.value, ThreadRole.moderator.value}
@@ -1156,6 +1174,7 @@ def _history(
     execution_id: str | None = None,
     agent_id: str | None = None,
     purpose: str = "chat",
+    current_message: str | None = None,
 ) -> list[dict]:
     rows = visible_messages(
         db, thread_id=thread_id, tenant_id=tenant_id,
@@ -1167,6 +1186,8 @@ def _history(
         turn_owner_agent_id=agent_id,
     )
     history=list(projection.messages)
+    if not can_read_messages(participant) and current_message is not None:
+        history.append({"role": "user", "content": current_message})
     history_policy_logger.info(
         "DIRECT_HISTORY_PROJECTED tenant_id=%s thread_id=%s owner_agent_id=%s policy=%s "
         "user_count=%s owner_assistant_count=%s cross_agent_context_count=%s cross_agent_ids=%s",
@@ -1179,17 +1200,21 @@ def _history(
         projection.cross_agent_context_count,
         ",".join(projection.cross_agent_ids),
     )
-    latest_user_content=next(
+    latest_user_content=current_message or next(
         (str(m.content or "") for m in reversed(ordered) if m.author_type=="user"),
         "",
     )
     system_guard=system_capability_guard_message(latest_user_content)
-    context=document_context_message(
-        db,
-        settings=settings,
-        tenant_id=tenant_id,
-        thread_id=thread_id,
-        query_text=latest_user_content,
+    context = (
+        document_context_message(
+            db,
+            settings=settings,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            query_text=latest_user_content,
+            visible_since=history_visible_since(participant),
+        )
+        if participant.can_view_attachments else None
     )
     system_messages=list(extra_system_messages or [])
     if system_guard:
@@ -1210,10 +1235,14 @@ def _history(
         )
     if context:
         system_messages.append(context)
-    persisted_artifacts = artifact_context_message(
-        db,
-        tenant_id=tenant_id,
-        thread_id=thread_id,
+    persisted_artifacts = (
+        artifact_context_message(
+            db,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            visible_since=history_visible_since(participant),
+        )
+        if participant.can_download_artifacts else None
     )
     if persisted_artifacts:
         system_messages.append(persisted_artifacts)
@@ -1223,7 +1252,7 @@ def _history(
 def health(settings: Settings=Depends(get_settings)):
     return {"status":"ok","release":"2.0.0a1","sha":settings.release_sha,"environment":settings.environment}
 
-EXPECTED_MIGRATION_HEAD = "013_agent_studio_control_plane"
+EXPECTED_MIGRATION_HEAD = "016_thread_participant_access_expiry"
 
 
 @router.get("/ready")
@@ -1475,7 +1504,7 @@ def update_thread_title(
     return {"id": thread.id, "title": thread.title}
 
 @router.get("/threads")
-def list_threads(p: Principal=Depends(require_provisioned_principal), db: Session=Depends(get_db),
+def list_threads(p: Principal=Depends(require_collaboration_principal), db: Session=Depends(get_db),
                  limit: int=Query(50, ge=1, le=200), offset: int=Query(0, ge=0)):
     """Lista apenas as threads do tenant nas quais o principal participa.
 
@@ -1487,22 +1516,34 @@ def list_threads(p: Principal=Depends(require_provisioned_principal), db: Sessio
           .where(Thread.tenant_id==p.tenant_id,
                  ThreadParticipant.tenant_id==p.tenant_id,
                  ThreadParticipant.user_id==p.user_id,
-                 ThreadParticipant.active.is_(True))
+                 ThreadParticipant.active.is_(True),
+                 or_(
+                     ThreadParticipant.access_expires_at.is_(None),
+                     ThreadParticipant.access_expires_at > datetime.now(timezone.utc),
+                 ))
           .order_by(Thread.created_at.desc(), Thread.id.desc())
           .limit(limit).offset(offset))
     rows=db.execute(stmt).all()
     total=db.scalar(select(func.count()).select_from(ThreadParticipant)
                     .where(ThreadParticipant.tenant_id==p.tenant_id,
                            ThreadParticipant.user_id==p.user_id,
-                           ThreadParticipant.active.is_(True))) or 0
+                           ThreadParticipant.active.is_(True),
+                           or_(
+                               ThreadParticipant.access_expires_at.is_(None),
+                               ThreadParticipant.access_expires_at > datetime.now(timezone.utc),
+                           ))) or 0
     return {"items":[{"id":t.id,"title":t.title,"created_at":t.created_at,"thread_role":role} for t,role in rows],
             "total":int(total),"limit":limit,"offset":offset}
 
 @router.get("/threads/{thread_id}/messages")
-def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
+def list_messages(thread_id: str,p:Principal=Depends(require_thread_principal),db:Session=Depends(get_db)):
     # Canonical access governs the history scope; never infer display names
     # across tenants or threads, even if a global user ID is present.
     _, member = thread_access(db, thread_id, p)
+    try:
+        require_message_read(member)
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
     rows = visible_messages(
         db, thread_id=thread_id, tenant_id=p.tenant_id, participant=member,
     )
@@ -1534,13 +1575,62 @@ def list_messages(thread_id: str,p:Principal=Depends(require_provisioned_princip
         "created_at":m.created_at,
     } for m in rows]
 
+@router.post("/threads/{thread_id}/human-messages", status_code=201)
+def post_human_message(
+    thread_id: str,
+    payload: HumanMessageCreate,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    """Persist a human-to-human message without invoking any AI/tool runtime.
+
+    Auth, tenant, thread and write grant are checked server-side. A read grant is
+    not implicitly conferred: read-disabled participants can post but not list
+    messages or supply preceding conversation context to an agent.
+    """
+    _, member = thread_access(db, thread_id, p)
+    try:
+        require_message_write(member)
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
+    row = Message(
+        tenant_id=p.tenant_id, thread_id=thread_id,
+        author_type="user", author_id=p.user_id, content=payload.content,
+    )
+    db.add(row)
+    db.flush()
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id,
+        actor_id=p.user_id,
+        action="thread_human_message_posted",
+        resource_type="thread_message",
+        resource_id=row.id,
+        outcome="success",
+        metadata_json={"thread_id": thread_id, "mode": "human"},
+    ))
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id, "thread_id": row.thread_id,
+        "author_type": row.author_type, "author_id": row.author_id,
+        "content": row.content, "created_at": row.created_at,
+        "mode": "human", "ai_invoked": False,
+    }
+
+
 @router.post("/threads/{thread_id}/messages")
-async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_provisioned_principal),
+async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_thread_principal),
                        settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     _,member=thread_access(db,thread_id,p)
-    if member.thread_role==ThreadRole.viewer.value: raise HTTPException(403,"THREAD_READ_ONLY")
-    effective_agent = _effective_agent_target(payload.agent, p)
+    try:
+        require_message_write(member)
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
+    effective_agent = _effective_agent_target(payload.agent, p, member, settings)
     decision=_resolve_target_or_404(effective_agent, settings)
+    require_agents_allowed(
+        member, [decision.execution.resolved_target], is_admin=principal_can_use_all_agents(p),
+    )
     execution=decision.execution
     availability=decision.availability
     turn=build_direct_turn(
@@ -1707,6 +1797,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
         execution_id=turn.execution_id,
         agent_id=turn.turn_owner_agent_id,
         purpose="chat",
+        current_message=payload.content,
     )
 
     try:
@@ -1782,7 +1873,7 @@ async def send_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(r
     return response_payload
 
 @router.post("/threads/{thread_id}/stream")
-async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_provisioned_principal),
+async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends(require_thread_principal),
                          settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     """SSE com contrato terminal garantido.
 
@@ -1791,10 +1882,16 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
     fechada antes da chamada ao provedor de LLM.
     """
     _,member=thread_access(db,thread_id,p)
-    if member.thread_role==ThreadRole.viewer.value: raise HTTPException(403,"THREAD_READ_ONLY")
+    try:
+        require_message_write(member)
+    except ThreadAccessPolicyError as exc:
+        raise HTTPException(exc.status_code, exc.code) from exc
     if not settings.realtime_streaming_enabled: raise HTTPException(403,"REALTIME_STREAMING_DISABLED")
-    effective_agent = _effective_agent_target(payload.agent, p)
+    effective_agent = _effective_agent_target(payload.agent, p, member, settings)
     decision=_resolve_target_or_404(effective_agent, settings)
+    require_agents_allowed(
+        member, [decision.execution.resolved_target], is_admin=principal_can_use_all_agents(p),
+    )
     execution=decision.execution
     availability=decision.availability
     turn=build_direct_turn(
@@ -1997,6 +2094,7 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             execution_id=turn.execution_id,
             agent_id=turn.turn_owner_agent_id,
             purpose="chat",
+            current_message=payload.content,
         )
     else:
         history=[]
@@ -2183,6 +2281,13 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
 
         message_id=None
         try:
+            require_live_stream_access(
+                stream_bind,
+                thread_id=thread_id, tenant_id=tenant_id, user_id=user_id,
+                expected_grant=stream_grant,
+                agent_ids=(turn.turn_owner_agent_id,),
+                is_admin=principal_can_use_all_agents(p),
+            )
             row,envelope=persist_agent_response(db,turn=turn,content=answer)
             message_id=row.id
         except Exception:
@@ -2203,6 +2308,13 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
                         artifact_intent,
                         agent_name=turn.display_agent_name,
                     ),
+                )
+                require_live_stream_access(
+                    stream_bind,
+                    thread_id=thread_id, tenant_id=tenant_id, user_id=user_id,
+                    expected_grant=stream_grant,
+                    agent_ids=(turn.turn_owner_agent_id,),
+                    is_admin=principal_can_use_all_agents(p),
                 )
                 generated_artifact=persist_validated_artifact(
                     db,
@@ -2285,29 +2397,257 @@ async def stream_message(thread_id:str,payload:MessageCreate,p:Principal=Depends
             )
         yield sse_event(terminal(RuntimeEventType.DONE, **done_payload))
 
-    return StreamingResponse(events(),media_type="text/event-stream",
-                             headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+    stream_bind = db.get_bind()
+    stream_grant = snapshot_grant(member)
+    return StreamingResponse(
+        guard_sse_stream(
+            events(),
+            bind=stream_bind,
+            thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id,
+            expected_grant=stream_grant,
+            agent_ids=(turn.turn_owner_agent_id,),
+            is_admin=principal_can_use_all_agents(p),
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"},
+    )
 
 @router.post("/threads/{thread_id}/invitations",response_model=InvitationOut)
-def invite(thread_id:str,payload:InvitationCreate,p:Principal=Depends(require_provisioned_principal),
+def invite(thread_id:str,payload:InvitationCreate,p:Principal=Depends(require_thread_principal),
            settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     thread,member=thread_access(db,thread_id,p)
     if member.thread_role not in INVITE_ALLOWED_ROLES:
         raise HTTPException(403,"INVITE_ROLE_REQUIRED")
     invitation,token=create_invitation(db,thread,payload,p,settings)
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id, actor_id=p.user_id, action="thread_invitation_created",
+        resource_type="thread_invitation", resource_id=invitation.id, outcome="success",
+        metadata_json={"thread_id": thread_id, "history_access": invitation.history_access,
+                       "can_read_messages": invitation.can_read_messages,
+                       "can_write_messages": invitation.can_write_messages,
+                       "can_view_attachments": invitation.can_view_attachments,
+                       "can_upload_files": invitation.can_upload_files,
+                       "can_download_artifacts": invitation.can_download_artifacts,
+                       "can_generate_artifacts": invitation.can_generate_artifacts,
+                       "allowed_agent_ids": invitation.allowed_agent_ids,
+                       "access_duration_hours": invitation.access_duration_hours},
+    ))
     db.commit()
     return InvitationOut(invitation_id=invitation.id,invitation_url=f"{settings.invitation_base_url}/{token}",expires_at=invitation.expires_at)
 
 @router.post("/invitations/accept")
 def accept(payload:InvitationAccept,p:Principal=Depends(require_known_principal),settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
-    invitation=accept_invitation(db,payload.token,p,settings); db.commit()
+    invitation=accept_invitation(db,payload.token,p,settings)
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id, actor_id=p.user_id, action="thread_invitation_accepted",
+        resource_type="thread_invitation", resource_id=invitation.id, outcome="success",
+        metadata_json={"thread_id": invitation.thread_id},
+    ))
+    db.commit()
     return {"status":"accepted","thread_id":invitation.thread_id}
 
+@router.get("/threads/{thread_id}/my-permissions")
+def my_thread_permissions(
+    thread_id: str,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    _, member = thread_access(db, thread_id, p)
+    return {
+        "role": member.thread_role,
+        "history_access": member.history_access,
+        "can_read_messages": can_read_messages(member),
+        "can_write_messages": can_write_messages(member),
+        "allowed_agent_ids": list(allowed_agent_ids(member)),
+        "can_upload_files": member.can_upload_files,
+        "can_view_attachments": member.can_view_attachments,
+        "can_download_artifacts": member.can_download_artifacts,
+        "can_generate_artifacts": member.can_generate_artifacts,
+        "access_expires_at": member.access_expires_at,
+    }
+
+
 @router.get("/threads/{thread_id}/participants")
-def participants(thread_id:str,p:Principal=Depends(require_provisioned_principal),db:Session=Depends(get_db)):
-    thread_access(db,thread_id,p)
-    rows=db.scalars(select(ThreadParticipant).where(ThreadParticipant.thread_id==thread_id,ThreadParticipant.active.is_(True))).all()
-    return [{"id":x.id,"user_id":x.user_id,"role":x.thread_role,"membership_type":x.membership_type} for x in rows]
+def participants(
+    thread_id: str,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    _, actor = thread_access(db, thread_id, p)
+    manager = actor.thread_role in INVITE_ALLOWED_ROLES
+    rows = db.execute(
+        select(ThreadParticipant, User)
+        .join(User, User.id == ThreadParticipant.user_id)
+        .where(
+            ThreadParticipant.tenant_id == p.tenant_id,
+            ThreadParticipant.thread_id == thread_id,
+            ThreadParticipant.active.is_(True),
+        )
+        .order_by(ThreadParticipant.joined_at.asc(), ThreadParticipant.id.asc())
+    ).all()
+    return [
+        {
+            "id": member.id,
+            "user_id": member.user_id,
+            "role": member.thread_role,
+            "membership_type": member.membership_type,
+            **({
+                "email": user.email,
+                "display_name": user.display_name,
+                "history_access": member.history_access,
+                "can_read_messages": can_read_messages(member),
+                "can_write_messages": can_write_messages(member),
+                "allowed_agent_ids": list(allowed_agent_ids(member)),
+                "can_upload_files": member.can_upload_files,
+                "can_view_attachments": member.can_view_attachments,
+                "can_download_artifacts": member.can_download_artifacts,
+                "can_generate_artifacts": member.can_generate_artifacts,
+                "access_expires_at": member.access_expires_at,
+                "access_expired": (
+                    member.access_expires_at is not None
+                    and (member.access_expires_at.replace(tzinfo=timezone.utc)
+                         if member.access_expires_at.tzinfo is None
+                         else member.access_expires_at) <= datetime.now(timezone.utc)
+                ),
+            } if manager else {}),
+        }
+        for member, user in rows
+    ]
+
+
+@router.put("/threads/{thread_id}/participants/{target_user_id}/permissions")
+def update_thread_participant_permissions(
+    thread_id: str,
+    target_user_id: str,
+    payload: ThreadParticipantGrantUpdate,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    _, actor = thread_access(db, thread_id, p)
+    if actor.thread_role != ThreadRole.owner.value:
+        raise HTTPException(403, "THREAD_PERMISSIONS_OWNER_REQUIRED")
+    target = db.scalar(
+        select(ThreadParticipant).where(
+            ThreadParticipant.tenant_id == p.tenant_id,
+            ThreadParticipant.thread_id == thread_id,
+            ThreadParticipant.user_id == target_user_id,
+            ThreadParticipant.active.is_(True),
+        ).with_for_update()
+    )
+    if target is None:
+        raise HTTPException(404, "THREAD_PARTICIPANT_NOT_FOUND")
+    if target.thread_role == ThreadRole.owner.value:
+        raise HTTPException(409, "THREAD_OWNER_PERMISSIONS_IMMUTABLE")
+    previous = {
+        "history_access": target.history_access,
+        "allowed_agent_ids": list(allowed_agent_ids(target)),
+        "can_upload_files": target.can_upload_files,
+        "can_read_messages": can_read_messages(target),
+        "can_write_messages": can_write_messages(target),
+        "can_view_attachments": target.can_view_attachments,
+        "can_download_artifacts": target.can_download_artifacts,
+        "can_generate_artifacts": target.can_generate_artifacts,
+    }
+    target.history_access = payload.history_access
+    target.allowed_agent_ids = list(payload.allowed_agent_ids)
+    target.can_upload_files = payload.can_upload_files
+    for key in ("can_read_messages", "can_write_messages", "can_view_attachments",
+                "can_download_artifacts", "can_generate_artifacts"):
+        value = getattr(payload, key)
+        if value is not None:
+            setattr(target, key, value)
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id, actor_id=p.user_id, action="thread_permissions_updated",
+        resource_type="thread_participant", resource_id=target.id, outcome="success",
+        metadata_json={
+            "thread_id": thread_id, "target_user_id": target_user_id,
+            "previous": previous,
+            "new": {
+                "history_access": target.history_access,
+                "allowed_agent_ids": target.allowed_agent_ids,
+                "can_upload_files": target.can_upload_files,
+                "can_read_messages": can_read_messages(target),
+                "can_write_messages": can_write_messages(target),
+                "can_view_attachments": target.can_view_attachments,
+                "can_download_artifacts": target.can_download_artifacts,
+                "can_generate_artifacts": target.can_generate_artifacts,
+            },
+        },
+    ))
+    db.commit()
+    return {"status": "updated", "user_id": target.user_id}
+
+
+@router.patch("/threads/{thread_id}/participants/{target_user_id}/access")
+def update_thread_participant_access(
+    thread_id: str,
+    target_user_id: str,
+    payload: ThreadParticipantAccessUpdate,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    _, actor = thread_access(db, thread_id, p)
+    if actor.thread_role != ThreadRole.owner.value:
+        raise HTTPException(403, "THREAD_PERMISSIONS_OWNER_REQUIRED")
+    target = db.scalar(
+        select(ThreadParticipant).where(
+            ThreadParticipant.tenant_id == p.tenant_id,
+            ThreadParticipant.thread_id == thread_id,
+            ThreadParticipant.user_id == target_user_id,
+            ThreadParticipant.active.is_(True),
+        ).with_for_update()
+    )
+    if target is None:
+        raise HTTPException(404, "THREAD_PARTICIPANT_NOT_FOUND")
+    if target.thread_role == ThreadRole.owner.value:
+        raise HTTPException(409, "THREAD_OWNER_PERMISSIONS_IMMUTABLE")
+
+    previous = target.access_expires_at
+    now = datetime.now(timezone.utc)
+    target.access_expires_at = (
+        now + timedelta(hours=payload.duration_hours)
+        if payload.duration_hours is not None else None
+    )
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id, actor_id=p.user_id,
+        action="thread_participant_access_duration_updated",
+        resource_type="thread_participant", resource_id=target.id, outcome="success",
+        metadata_json={
+            "thread_id": thread_id, "target_user_id": target_user_id,
+            "previous_expires_at": previous.isoformat() if previous else None,
+            "new_expires_at": target.access_expires_at.isoformat()
+                if target.access_expires_at else None,
+            "duration_hours": payload.duration_hours,
+        },
+    ))
+    db.commit()
+    return {
+        "status": "updated", "user_id": target.user_id,
+        "access_expires_at": target.access_expires_at,
+    }
+
+
+@router.post("/threads/{thread_id}/participants/{target_user_id}/revoke")
+@router.delete("/threads/{thread_id}/participants/{target_user_id}")
+def remove_thread_participant(
+    thread_id: str,
+    target_user_id: str,
+    p: Principal = Depends(require_thread_principal),
+    db: Session = Depends(get_db),
+):
+    _, actor = thread_access(db, thread_id, p)
+    if actor.thread_role != ThreadRole.owner.value:
+        raise HTTPException(403, "THREAD_PERMISSIONS_OWNER_REQUIRED")
+    revoked = revoke_participant(
+        db, thread_id=thread_id, target_user_id=target_user_id, principal=p,
+    )
+    db.add(AuditEvent(
+        tenant_id=p.tenant_id, actor_id=p.user_id, action="thread_participant_revoked",
+        resource_type="thread_participant", resource_id=revoked.id, outcome="success",
+        metadata_json={"thread_id": thread_id, "target_user_id": target_user_id},
+    ))
+    db.commit()
+    return {"status": "revoked", "user_id": target_user_id}
 
 _THREAD_DOCUMENT_ALLOWED_MIME = {
     "application/pdf",
@@ -2474,7 +2814,7 @@ async def intake_large_file_upload(
 
 
 @router.post("/threads/{thread_id}/attachments")
-async def upload_attachment(thread_id:str,file:UploadFile=File(...),p:Principal=Depends(require_provisioned_principal),
+async def upload_attachment(thread_id:str,file:UploadFile=File(...),p:Principal=Depends(require_thread_principal),
                             settings:Settings=Depends(get_settings),db:Session=Depends(get_db)):
     if not settings.artifacts_enabled:
         raise HTTPException(403,"ARTIFACTS_DISABLED")
@@ -2532,6 +2872,7 @@ def document_context_provenance(
         settings=settings,
         tenant_id=p.tenant_id,
         thread_id=thread_id,
+        visible_since=history_visible_since(member),
     )
     if bundle is None:
         return {
@@ -2590,11 +2931,15 @@ def list_artifacts(
     _,member=thread_access(db,thread_id,p)
     if not member.can_download_artifacts:
         raise HTTPException(403,"ARTIFACT_DOWNLOAD_PERMISSION_REQUIRED")
-    rows=db.scalars(
-        select(Artifact).where(
-            Artifact.thread_id==thread_id,
-            Artifact.tenant_id==p.tenant_id,
-        ).order_by(Artifact.created_at.desc(), Artifact.id.desc())
+    query = select(Artifact).where(
+        Artifact.thread_id == thread_id,
+        Artifact.tenant_id == p.tenant_id,
+    )
+    since = history_visible_since(member)
+    if since is not None:
+        query = query.where(Artifact.created_at >= since)
+    rows = db.scalars(
+        query.order_by(Artifact.created_at.desc(), Artifact.id.desc())
     ).all()
     return [{
         "id":row.id,
@@ -2620,6 +2965,11 @@ def download_artifact(
     _,member=thread_access(db,row.thread_id,p)
     if not member.can_download_artifacts:
         raise HTTPException(403,"ARTIFACT_DOWNLOAD_PERMISSION_REQUIRED")
+    since = history_visible_since(member)
+    if since is not None and db.scalar(
+        select(Artifact.id).where(Artifact.id == row.id, Artifact.created_at >= since)
+    ) is None:
+        raise HTTPException(404, "ARTIFACT_NOT_FOUND")
     try:
         raw = build_blob_storage(settings).get(row.storage_key)
     except BlobStorageError as exc:

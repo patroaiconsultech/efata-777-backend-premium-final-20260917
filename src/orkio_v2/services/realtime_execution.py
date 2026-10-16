@@ -30,6 +30,7 @@ from .team_runtime import (
 )
 from .realtime_segmenter import SentenceSegmenter
 from .thread_access_policy import ThreadAccessPolicyError, require_thread_access
+from .active_stream_access import snapshot_grant, require_live_stream_access
 
 
 class RealtimeExecutionError(RuntimeError):
@@ -454,13 +455,22 @@ async def stream_realtime_direct(
             requested_target=agent_id,
             channel=RuntimeChannel.REALTIME,
         )
-        persist_user_message(db, turn=turn, content=transcript)
         participant = _realtime_participant(
             db,
             thread_id=thread_id,
             tenant_id=tenant_id,
             user_id=user_id,
         )
+        stream_grant = snapshot_grant(participant)
+        stream_bind = db.get_bind()
+        require_live_stream_access(
+            stream_bind,
+            thread_id=thread_id, tenant_id=tenant_id, user_id=user_id,
+            expected_grant=stream_grant,
+            agent_ids=(turn.turn_owner_agent_id,),
+            is_admin=is_admin,
+        )
+        persist_user_message(db, turn=turn, content=transcript)
         history = team_history(
             db,
             thread_id=thread_id,
@@ -593,6 +603,13 @@ async def stream_realtime_direct(
         )
 
     try:
+        require_live_stream_access(
+            stream_bind,
+            thread_id=thread_id, tenant_id=tenant_id, user_id=user_id,
+            expected_grant=stream_grant,
+            agent_ids=(turn.turn_owner_agent_id,),
+            is_admin=is_admin,
+        )
         row, envelope = persist_agent_response(db, turn=turn, content=answer)
     except Exception as exc:
         raise _unexpected_execution_error(stage="persist_agent", exc=exc, turn=turn) from exc

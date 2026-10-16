@@ -23,6 +23,8 @@ from .services.direct_runtime import build_turn as build_direct_turn
 from .services.execution_router import resolve_direct_target_decision
 from .services.identity import require_collaboration_principal, require_thread_principal
 from .services.hyper_cocreator import is_allowlisted_admin
+from .services.thread_agent_grants import require_agents_allowed, principal_can_use_all_agents
+from .services.active_stream_access import guard_sse_stream, snapshot_grant
 from .services.realtime_bridge import (
     RealtimeBridgeError,
     complete_receipt,
@@ -60,11 +62,27 @@ router = APIRouter(prefix="/api/v2", tags=["realtime"])
 realtime_logger = logging.getLogger("uvicorn.error")
 
 
-def _effective_direct_agent(requested_target: str, principal: Principal) -> str:
-    if {"admin", "orkio_admin", "owner", "superadmin", "platform_owner"}.intersection(principal.roles):
+def _effective_direct_agent(
+    requested_target: str,
+    principal: Principal,
+    member: ThreadParticipant,
+    settings: Settings,
+) -> str:
+    if principal_can_use_all_agents(principal) or member.allowed_agent_ids is not None:
         return requested_target
-    # O resolver usa o namespace técnico explícito para IDs de agentes.
     return "id:orkio"
+
+
+def _authorize_realtime_intent(
+    member: ThreadParticipant, intent: dict[str, object], principal: Principal, settings: Settings
+) -> None:
+    ids = [str(intent.get("agent_id") or "")]
+    if intent.get("target_mode") == "team":
+        contributors = intent.get("contributor_agent_ids")
+        if not isinstance(contributors, list):
+            raise HTTPException(403, "THREAD_AGENT_GRANT_INVALID")
+        ids += [str(item) for item in contributors]
+    require_agents_allowed(member, ids, is_admin=principal_can_use_all_agents(principal))
 
 
 class RealtimeCallCreate(BaseModel):
@@ -257,7 +275,7 @@ async def realtime_call(
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    _thread_access(db, thread_id=thread_id, principal=p)
+    member = _thread_access(db, thread_id=thread_id, principal=p)
     _audit(
         db,
         principal=p,
@@ -271,8 +289,12 @@ async def realtime_call(
         if payload.target_mode == "direct":
             if not (payload.agent or "").strip():
                 raise HTTPException(422, detail={"code": "REALTIME_TARGET_REQUIRED"})
-            effective_agent = _effective_direct_agent(str(payload.agent), p)
+            effective_agent = _effective_direct_agent(str(payload.agent), p, member, settings)
             decision = resolve_direct_target_decision(effective_agent, settings)
+            require_agents_allowed(
+                member, [decision.execution.resolved_target],
+                is_admin=principal_can_use_all_agents(p),
+            )
             turn = build_direct_turn(
                 execution=decision.execution,
                 thread_id=thread_id,
@@ -293,6 +315,10 @@ async def realtime_call(
                 settings=settings,
                 selection_mode=payload.selection_mode,
                 contributor_agent_ids=payload.contributor_agent_ids,
+            )
+            require_agents_allowed(
+                member, [plan.orchestrator_agent_id, *plan.contributor_agent_ids],
+                is_admin=principal_can_use_all_agents(p),
             )
             turn = build_team_turn(
                 thread_id=thread_id,
@@ -585,7 +611,7 @@ async def realtime_stream_turn(
     This endpoint owns the canonical LLM stream and uses the configured TTS
     adapter once per safe sentence as an incremental compatibility path.
     """
-    _thread_access(db, thread_id=thread_id, principal=p)
+    member = _thread_access(db, thread_id=thread_id, principal=p)
     if not settings.realtime_bridge_enabled:
         raise HTTPException(503, detail={"code": "REALTIME_ORCHESTRATION_BRIDGE_REQUIRED"})
     if not settings.tts_enabled:
@@ -599,6 +625,7 @@ async def realtime_stream_turn(
     )
     if str(intent.get("target_mode") or "direct") != "direct":
         raise HTTPException(409, detail={"code": "REALTIME_STREAM_TEAM_NOT_SUPPORTED"})
+    _authorize_realtime_intent(member, intent, p, settings)
     agent_id = str(intent.get("agent_id") or "").strip()
     if not agent_id:
         raise HTTPException(409, detail={"code": "REALTIME_OWNER_MISMATCH"})
@@ -775,7 +802,15 @@ async def realtime_stream_turn(
                 })
 
     return StreamingResponse(
-        events(),
+        guard_sse_stream(
+            events(),
+            bind=db.get_bind(),
+            thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id,
+            expected_grant=snapshot_grant(member),
+            agent_ids=(agent_id,),
+            is_admin=principal_can_use_all_agents(p),
+            realtime=True,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
@@ -789,7 +824,7 @@ async def realtime_final_turn(
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    _thread_access(db, thread_id=thread_id, principal=p)
+    member = _thread_access(db, thread_id=thread_id, principal=p)
     if not settings.realtime_bridge_enabled:
         raise HTTPException(503, detail={"code": "REALTIME_ORCHESTRATION_BRIDGE_REQUIRED"})
 
@@ -799,6 +834,7 @@ async def realtime_final_turn(
         thread_id=thread_id,
         session_id=payload.session_id,
     )
+    _authorize_realtime_intent(member, intent, p, settings)
     transcript = payload.transcript.strip()
     if not transcript:
         raise HTTPException(422, detail={"code": "REALTIME_TRANSCRIPT_EMPTY"})

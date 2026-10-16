@@ -117,12 +117,19 @@ class ThreadParticipant(Base):
     thread_role: Mapped[str] = mapped_column(String(30), default=ThreadRole.participant.value)
     membership_type: Mapped[str] = mapped_column(String(30), default="tenant_member")
     history_access: Mapped[str] = mapped_column(String(30), default="from_join")
+    # Null represents the pre-migration legacy grant: Josué only for non-admins.
+    allowed_agent_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    # NULL inherits pre-015 behavior; explicit False revokes the capability.
+    can_read_messages: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    can_write_messages: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     can_view_attachments: Mapped[bool] = mapped_column(Boolean, default=False)
     can_download_artifacts: Mapped[bool] = mapped_column(Boolean, default=False)
     can_upload_files: Mapped[bool] = mapped_column(Boolean, default=False)
     can_generate_artifacts: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    # NULL preserves unlimited access for grants created before migration 016.
+    access_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 class ThreadInvitation(Base):
     __tablename__="thread_invitations"
@@ -134,6 +141,10 @@ class ThreadInvitation(Base):
     token_prefix: Mapped[str] = mapped_column(String(12))
     thread_role: Mapped[str] = mapped_column(String(30), default=ThreadRole.participant.value)
     history_access: Mapped[str] = mapped_column(String(30), default="from_join")
+    # Null represents the pre-migration legacy grant: Josué only for non-admins.
+    allowed_agent_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    can_read_messages: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    can_write_messages: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     can_view_attachments: Mapped[bool] = mapped_column(Boolean, default=False)
     can_download_artifacts: Mapped[bool] = mapped_column(Boolean, default=False)
     can_upload_files: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -144,6 +155,9 @@ class ThreadInvitation(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     accepted_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Invitation-token expiry is separate from accepted participant access lifetime.
+    # NULL on older invitations preserves their historical unlimited grant.
+    access_duration_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 class PlatformInvitation(Base):
     __tablename__ = "platform_invitations"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -12,19 +14,21 @@ def artifact_context_message(
     tenant_id: str,
     thread_id: str,
     limit: int = 8,
+    visible_since: datetime | None = None,
 ) -> dict[str, str] | None:
     """Trusted runtime context for artifacts already committed to persistence.
 
     This is intentionally DB-derived. The LLM may confirm only the artifacts
     listed here and must not invent generation/download state.
     """
+    query = select(Artifact).where(
+        Artifact.tenant_id == tenant_id,
+        Artifact.thread_id == thread_id,
+    )
+    if visible_since is not None:
+        query = query.where(Artifact.created_at >= visible_since)
     rows = db.scalars(
-        select(Artifact)
-        .where(
-            Artifact.tenant_id == tenant_id,
-            Artifact.thread_id == thread_id,
-        )
-        .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+        query.order_by(Artifact.created_at.desc(), Artifact.id.desc())
         .limit(limit)
     ).all()
     if not rows:

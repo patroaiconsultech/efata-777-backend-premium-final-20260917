@@ -14,6 +14,8 @@ from .auth import Principal
 from .config import Settings, get_settings
 from .database import get_db
 from .services import llm
+from .services.thread_agent_grants import require_agents_allowed, principal_can_use_all_agents
+from .services.active_stream_access import guard_sse_stream, snapshot_grant, require_live_stream_access
 from .services.identity import require_collaboration_principal, require_thread_principal
 from .services.team_runtime import (
     TeamContractError,
@@ -100,6 +102,11 @@ async def stream_team_message(
     except TeamContractError as exc:
         _raise_team_error(exc)
 
+    require_agents_allowed(
+        member,
+        [plan.orchestrator_agent_id, *plan.contributor_agent_ids],
+        is_admin=principal_can_use_all_agents(p),
+    )
     if not settings.realtime_streaming_enabled:
         raise HTTPException(403, "REALTIME_STREAMING_DISABLED")
 
@@ -171,6 +178,7 @@ async def stream_team_message(
         execution_id=turn.execution_id,
         agent_id=turn.turn_owner_agent_id,
         purpose="team",
+        current_message=payload.content,
     )
 
     correlation = ExecutionCorrelation(
@@ -303,6 +311,13 @@ async def stream_team_message(
                     continue
 
                 try:
+                    require_live_stream_access(
+                        stream_bind,
+                        thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id,
+                        expected_grant=stream_grant,
+                        agent_ids=(plan.orchestrator_agent_id, *plan.contributor_agent_ids),
+                        is_admin=principal_can_use_all_agents(p),
+                    )
                     persist_team_contribution(
                         db,
                         turn=turn,
@@ -448,6 +463,13 @@ async def stream_team_message(
                 return
 
             try:
+                require_live_stream_access(
+                    stream_bind,
+                    thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id,
+                    expected_grant=stream_grant,
+                    agent_ids=(plan.orchestrator_agent_id, *plan.contributor_agent_ids),
+                    is_admin=principal_can_use_all_agents(p),
+                )
                 row, envelope = persist_team_final(db, turn=turn, content=answer)
             except Exception:
                 db.rollback()
@@ -503,8 +525,17 @@ async def stream_team_message(
             )
             raise
 
+    stream_bind = db.get_bind()
+    stream_grant = snapshot_grant(member)
     return StreamingResponse(
-        events(),
+        guard_sse_stream(
+            events(),
+            bind=stream_bind,
+            thread_id=thread_id, tenant_id=p.tenant_id, user_id=p.user_id,
+            expected_grant=stream_grant,
+            agent_ids=(plan.orchestrator_agent_id, *plan.contributor_agent_ids),
+            is_admin=principal_can_use_all_agents(p),
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
