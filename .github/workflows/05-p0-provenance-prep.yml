@@ -1,0 +1,206 @@
+name: "EFATA 777 P0 - preparacao de proveniencia (sem DB)"
+
+# NOVO workflow, separado de 03-postgres-integration.yml.
+# proposal_only: NAO COMMITAR / NAO EXECUTAR sem gate AO-01.
+on:
+  workflow_dispatch:
+    inputs:
+      approval_phrase:
+        description: "Exige parecer AO-01: P0_PROVENIENCIA_SOMENTE"
+        required: true
+        type: string
+      approved_sha:
+        description: "SHA completo (40 hex) aprovado pelo AO-01 para a branch P0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: efata-p0-provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  p0-provenance-only:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      P0_EXPECTED_LOCK_SHA256: "bd12488043a326e96c86b03abf888eebf6fc43252760d2c2fdb29d20fc3bc226"
+      P0_EXPECTED_REF: "refs/heads/ensaio/p0-schema-colaboracao-20261017"
+      # Variavel de REPOSITORIO preenchida APENAS apos autorizacao AO-01,
+      # em gate GitHub separado. Ausente -> HOLD, nunca aceitar apenas input.
+      P0_AO01_APPROVED_SHA: ${{ vars.EFATA_P0_GHA05_APPROVED_SHA }}
+      P0_POSTGRES_CANDIDATE: "docker.io/library/postgres:18.6"
+      # Esta imagem NAO equivale ao qualificador: nao se presume pg_dump 18.6.
+      P0_PYTHON_BASE_CANDIDATE: "docker.io/library/python:3.12-slim-bookworm"
+    steps:
+      - name: "Gate de intencao, branch e ausencia de disparo automatico"
+        shell: bash
+        env:
+          P0_APPROVAL_PHRASE: ${{ inputs.approval_phrase }}
+          P0_OPERATOR_SHA: ${{ inputs.approved_sha }}
+        run: |
+          set -Eeuo pipefail
+          test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+          test "${GITHUB_REF}" = "${P0_EXPECTED_REF}"
+          test "${P0_APPROVAL_PHRASE}" = "P0_PROVENIENCIA_SOMENTE"
+          # SHA imutavel exigido em TRES fontes independentes:
+          # repo var auditada, input informado e evento GitHub.
+          [[ "${P0_AO01_APPROVED_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "HOLD_APPROVED_SHA_UNSET_OR_INVALID"; exit 1; }
+          [[ "${P0_OPERATOR_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "HOLD_OPERATOR_SHA_INVALID"; exit 1; }
+          test "${P0_OPERATOR_SHA}" = "${P0_AO01_APPROVED_SHA}" || { echo "HOLD_SHA_NOT_APPROVED"; exit 1; }
+          test "${GITHUB_SHA}" = "${P0_AO01_APPROVED_SHA}" || { echo "HOLD_EVENT_SHA_NOT_APPROVED"; exit 1; }
+          test "${GITHUB_REPOSITORY}" = "patroaiconsultech/efata-777-backend-premium-final-20260917"
+          test "${RUNNER_OS}" = "Linux"
+          test "${RUNNER_ARCH}" = "X64"
+
+      - name: "Checkout sem persistencia de credenciais"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: "Provar HEAD exato do checkout antes de executar codigo"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual="$(git rev-parse --verify HEAD)"
+          [[ "${actual}" =~ ^[0-9a-f]{40}$ ]]
+          test "${actual}" = "${GITHUB_SHA}"
+          test "${actual}" = "${P0_AO01_APPROVED_SHA}" || { echo "HOLD_CHECKOUT_SHA_NOT_APPROVED"; exit 1; }
+
+      - name: "Python 3.12"
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: "Criar diretorio de evidencias e conferir lock B39"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p build-evidence/p0-prep/wheelhouse
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          import platform, sys
+          p = Path("requirements-test.lock.txt")
+          assert p.is_file(), "LOCK_AUSENTE"
+          digest = sha256(p.read_bytes()).hexdigest()
+          assert digest == "bd12488043a326e96c86b03abf888eebf6fc43252760d2c2fdb29d20fc3bc226", "B39_LOCK_DIVERGENTE"
+          assert sys.version_info[:2] == (3, 12), "PYTHON_DIVERGENTE"
+          assert platform.system() == "Linux" and platform.machine() in ("x86_64", "AMD64"), "PLATAFORMA_DIVERGENTE"
+          Path("build-evidence/p0-prep/b39-lock-sha256.txt").write_text(digest + "  requirements-test.lock.txt\n")
+          PY
+          python --version > build-evidence/p0-prep/python-version.txt
+          python -m pip --version > build-evidence/p0-prep/pip-version.txt
+          docker buildx version > build-evidence/p0-prep/buildx-version.txt
+
+      - name: "Capturar manifests oficiais, digests imutaveis e plataforma (sem docker run/pull)"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          ev="build-evidence/p0-prep"
+          for item in "postgres|${P0_POSTGRES_CANDIDATE}" "python_base|${P0_PYTHON_BASE_CANDIDATE}"; do
+            label="${item%%|*}"
+            ref="${item#*|}"
+            case "${ref}" in
+              docker.io/library/postgres:18.6|docker.io/library/python:3.12-slim-bookworm) ;;
+              *) echo "IMAGE_REF_NOT_ALLOWLISTED" >&2; exit 1 ;;
+            esac
+            docker buildx imagetools inspect --raw "${ref}" > "${ev}/${label}.oci-manifest.json"
+            python scripts/p0_verify_oci_manifest.py \
+              --manifest "${ev}/${label}.oci-manifest.json" \
+              --reference "${ref}" \
+              --report "${ev}/${label}.oci-proof.json"
+            digest="$(sha256sum "${ev}/${label}.oci-manifest.json" | cut -d' ' -f1)"
+            immutable="${ref%:*}@sha256:${digest}"
+            docker buildx imagetools inspect "${immutable}" > "${ev}/${label}.pinned-inspect.txt"
+            printf '%s\n' "${immutable}" > "${ev}/${label}.pinned-ref.txt"
+          done
+
+      - name: "Coletar somente wheels verificados pelo lock B39 (rede PyPI publica)"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          python -m pip --isolated download \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --require-hashes \
+            --only-binary=:all: \
+            --index-url https://pypi.org/simple \
+            --dest build-evidence/p0-prep/wheelhouse \
+            -r requirements-test.lock.txt
+
+      - name: "Validar completude do lock, tags cp312/linux-amd64 e hashes"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python scripts/p0_validate_wheelhouse.py \
+            --lock requirements-test.lock.txt \
+            --wheelhouse build-evidence/p0-prep/wheelhouse \
+            --report build-evidence/p0-prep/wheelhouse-proof.json \
+            --expected-lock-sha256 "${P0_EXPECTED_LOCK_SHA256}"
+
+      - name: "Demonstrar instalacao estritamente offline e validar dependencias"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          python -m venv "${RUNNER_TEMP}/p0-provenance-offline-venv"
+          "${RUNNER_TEMP}/p0-provenance-offline-venv/bin/python" -m pip --isolated install \
+            --disable-pip-version-check \
+            --no-index \
+            --no-cache-dir \
+            --require-hashes \
+            --only-binary=:all: \
+            --find-links=build-evidence/p0-prep/wheelhouse \
+            -r requirements-test.lock.txt
+          "${RUNNER_TEMP}/p0-provenance-offline-venv/bin/python" -m pip --isolated check \
+            > build-evidence/p0-prep/offline-pip-check.txt
+          "${RUNNER_TEMP}/p0-provenance-offline-venv/bin/python" -m pip --isolated freeze \
+            > build-evidence/p0-prep/offline-installed-freeze.txt
+          echo "OFFLINE_INSTALL=PASS" > build-evidence/p0-prep/offline-status.txt
+
+      - name: "Registrar metadados, arquivos e estados (sem segredos)"
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          ev="build-evidence/p0-prep"
+          mkdir -p "${ev}"
+          {
+            printf 'repository=%s\n' "${GITHUB_REPOSITORY}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'sha=%s\n' "${GITHUB_SHA}"
+            printf 'ref=%s\n' "${GITHUB_REF}"
+            printf 'runner_os=%s\n' "${RUNNER_OS}"
+            printf 'runner_arch=%s\n' "${RUNNER_ARCH}"
+            printf 'postgres_server_started=false\n'
+            printf 'migration_executed=false\n'
+            printf 'railway_access=false\n'
+            printf 'qualifier_image_approved=false\n'
+          } > "${ev}/run-metadata.txt"
+          (cd "${ev}" && find . -type f -not -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 -r sha256sum) > "${ev}/SHA256SUMS.txt"
+
+      - name: "Publicar evidencias e wheels sinteticos de preparacao"
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4 immutable pin
+        with:
+          name: efata-p0-provenance-prep-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-evidence/p0-prep/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
